@@ -15,12 +15,15 @@ from email.mime.text import MIMEText
 from pathlib import Path
 
 import requests
+import yaml
+import fitz
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
+CONFIG_FILE = Path(__file__).parent / "config.yaml"
 SEEN_FILE = Path(__file__).parent / "seen_posts.json"
 RESULTS_DIR = Path(__file__).parent / "results"
 PRUNE_DAYS = 180  # 6 months
@@ -71,6 +74,59 @@ _neg_patterns = {}
 for _kw in NEGATIVE_KEYWORDS:
     _escaped = re.escape(_kw)
     _neg_patterns[_kw] = re.compile(r"\b" + _escaped + r"\b", re.IGNORECASE)
+
+# ---------------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------------
+
+def load_config(path=None):
+    """Load config from YAML file. Returns None if file doesn't exist."""
+    p = Path(path) if path else CONFIG_FILE
+    if not p.exists():
+        return None
+    with open(p) as f:
+        return yaml.safe_load(f)
+
+
+def apply_config(config):
+    """Apply loaded config to global settings."""
+    global KEYWORD_CATEGORIES, NEGATIVE_KEYWORDS, _kw_patterns, _neg_patterns
+
+    if not config:
+        return
+
+    if "keyword_categories" in config:
+        KEYWORD_CATEGORIES = config["keyword_categories"]
+        _kw_patterns.clear()
+        for cat, info in KEYWORD_CATEGORIES.items():
+            for kw in info["keywords"]:
+                _escaped = re.escape(kw)
+                _kw_patterns[kw] = re.compile(r"\b" + _escaped + r"\b", re.IGNORECASE)
+
+    if "negative_keywords" in config:
+        NEGATIVE_KEYWORDS = config["negative_keywords"]
+        _neg_patterns.clear()
+        for kw in NEGATIVE_KEYWORDS:
+            _escaped = re.escape(kw)
+            _neg_patterns[kw] = re.compile(r"\b" + _escaped + r"\b", re.IGNORECASE)
+
+
+# ---------------------------------------------------------------------------
+# Resume text extraction
+# ---------------------------------------------------------------------------
+
+def extract_resume_text(pdf_path):
+    """Extract plain text from a PDF resume using PyMuPDF."""
+    path = Path(pdf_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Resume not found: {pdf_path}")
+    doc = fitz.open(str(path))
+    text = ""
+    for page in doc:
+        text += page.get_text()
+    doc.close()
+    return text.strip()
+
 
 # ---------------------------------------------------------------------------
 # HN API helpers
@@ -595,13 +651,26 @@ def main():
     parser = argparse.ArgumentParser(description="Scan HN 'Who is Hiring?' threads")
     parser.add_argument("--no-email", action="store_true", help="Print to terminal only")
     parser.add_argument("--dry-run", action="store_true", help="Save HTML preview locally")
+    parser.add_argument("--resume", metavar="PDF", help="Path to PDF resume for context")
     args = parser.parse_args()
+
+    # Load optional config
+    config = load_config()
+    if config:
+        apply_config(config)
+
+    # Load optional resume
+    resume_text = None
+    if args.resume:
+        resume_text = extract_resume_text(args.resume)
+        print(f"Loaded resume ({len(resume_text)} chars)")
 
     need_email = not args.no_email and not args.dry_run
     if need_email:
-        email_to = os.environ.get("HN_JOBS_EMAIL_TO")
-        email_from = os.environ.get("HN_JOBS_EMAIL_FROM")
-        email_pass = os.environ.get("HN_JOBS_EMAIL_PASSWORD")
+        email_cfg = (config or {}).get("email", {})
+        email_to = os.environ.get("HN_JOBS_EMAIL_TO") or email_cfg.get("to")
+        email_from = os.environ.get("HN_JOBS_EMAIL_FROM") or email_cfg.get("from")
+        email_pass = os.environ.get("HN_JOBS_EMAIL_PASSWORD") or email_cfg.get("password")
         if not all([email_to, email_from, email_pass]):
             print("ERROR: Set HN_JOBS_EMAIL_TO, HN_JOBS_EMAIL_FROM, HN_JOBS_EMAIL_PASSWORD", file=sys.stderr)
             print("Or use --no-email / --dry-run", file=sys.stderr)
