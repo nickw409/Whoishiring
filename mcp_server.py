@@ -223,14 +223,14 @@ def scan_jobs(months: int = 1, ignore_seen: bool = False) -> str:
     return json.dumps(output, indent=2)
 
 
-WAAS_MAX_RESULTS = 300
+WAAS_MAX_RESULTS = 1000
 
 
 @mcp.tool()
 def scan_waas(ignore_seen: bool = False) -> str:
     """Scan Work at a Startup (workatastartup.com) for matching engineering jobs.
 
-    Returns up to the top 300 results sorted by keyword score.
+    Returns up to the top 1000 results sorted by keyword score.
     Descriptions are truncated to 500 chars — enough for ranking.
     Results are pre-filtered by keyword categories (AI tooling, Systems,
     General AI+SWE), negative keywords (senior/management), and location
@@ -284,14 +284,14 @@ def scan_waas(ignore_seen: bool = False) -> str:
     }, indent=2)
 
 
-ALL_MAX_RESULTS = 300
+ALL_MAX_RESULTS = 1000
 
 
 @mcp.tool()
 def scan_all(ignore_seen: bool = False, months: int = 1) -> str:
     """Scan both HN Who's Hiring and Work at a Startup, then combine results.
 
-    Returns up to the top 300 results sorted by keyword score, with full
+    Returns up to the top 1000 results sorted by keyword score, with full
     descriptions included. Runs both scans in parallel for speed.
 
     Cross-source deduplication: if a company appears on both HN and WAAS,
@@ -514,7 +514,7 @@ def find_jobs() -> str:
         "Use get_resume and get_preferences to understand my background, "
         "then scan_all with ignore_seen=true to find matching positions from "
         "both HN Who's Hiring and Work at a Startup (YC's job board). "
-        "Returns up to the top 300 results by keyword score with full descriptions. "
+        "Returns up to the top 1000 results by keyword score with full descriptions. "
         "Rank every job from best to worst fit for me. "
         "For each of your top 15, include: rank, company name, job title, "
         "location/remote, salary range (if available from WAAS), YC batch "
