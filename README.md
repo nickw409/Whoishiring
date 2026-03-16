@@ -59,6 +59,13 @@ preferences:
 
 Without these, WAAS scraping is limited to ~30 jobs. With credentials, all engineering listings are accessible.
 
+Add these to the project `.env` file (already gitignored):
+
+```bash
+echo 'WAAS_USERNAME=your_username' >> .env
+echo 'WAAS_PASSWORD=your_password' >> .env
+```
+
 ## CLI Usage
 
 ```bash
@@ -90,7 +97,9 @@ The MCP server lets Claude Desktop scan and rank jobs directly in conversation â
 
 ### Setup
 
-Add to your Claude Desktop config (`claude_desktop_config.json`):
+Add to your Claude Desktop config (`claude_desktop_config.json`).
+
+On WSL, use `bash -c` to source the `.env` file so credentials stay out of the config:
 
 ```json
 {
@@ -99,23 +108,26 @@ Add to your Claude Desktop config (`claude_desktop_config.json`):
       "type": "stdio",
       "command": "wsl",
       "args": [
-        "/path/to/project/.venv/bin/python3",
-        "/path/to/project/mcp_server.py"
+        "bash", "-c",
+        "set -a; source /path/to/project/.env; set +a; /path/to/project/.venv/bin/python3 /path/to/project/mcp_server.py"
       ]
     }
   }
 }
 ```
 
-If not on WSL, use the Python path directly:
+If not on WSL:
 
 ```json
 {
   "mcpServers": {
     "hn-jobs": {
       "type": "stdio",
-      "command": "/path/to/project/.venv/bin/python3",
-      "args": ["/path/to/project/mcp_server.py"]
+      "command": "bash",
+      "args": [
+        "-c",
+        "set -a; source /path/to/project/.env; set +a; /path/to/project/.venv/bin/python3 /path/to/project/mcp_server.py"
+      ]
     }
   }
 }
