@@ -460,6 +460,100 @@ def is_first_run(seen):
 
 
 # ---------------------------------------------------------------------------
+# Claude ranking
+# ---------------------------------------------------------------------------
+
+def build_ranking_prompt(results, resume_text, preferences):
+    """Build the prompt for Claude job ranking."""
+    jobs_payload = []
+    for i, item in enumerate(results):
+        p = item["parsed"]
+        jobs_payload.append({
+            "index": i,
+            "company": p["company"],
+            "location": p["location"],
+            "remote": p["remote"],
+            "snippet": p["snippet"],
+            "matched_categories": list(item["matches"].keys()),
+            "matched_keywords": [kw for kws in item["matches"].values() for kw in kws],
+            "score": item["score"],
+        })
+
+    return f"""You are a job matching assistant. Given a candidate's resume and preferences, rank these job postings from best to worst fit.
+
+RESUME:
+{resume_text}
+
+PREFERENCES:
+{preferences if preferences else "No specific preferences provided."}
+
+JOB POSTINGS:
+{json.dumps(jobs_payload, indent=2)}
+
+Return a JSON array where each element has:
+- "index": the original index from the input
+- "reason": a brief explanation (1-2 sentences) of why this job is ranked here
+
+Order the array from best fit (first) to worst fit (last). Include ALL jobs.
+Return ONLY the JSON array, no other text."""
+
+
+def rank_jobs_with_claude(results, config):
+    """Rank jobs using Claude API. Returns reordered results list, or None on failure."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("WARNING: ANTHROPIC_API_KEY not set, skipping Claude ranking", file=sys.stderr)
+        return None
+
+    resume_text = config["resume_text"]
+    preferences = config["preferences"]
+    if not resume_text:
+        print("No resume loaded, skipping Claude ranking")
+        return None
+
+    import anthropic
+
+    prompt = build_ranking_prompt(results, resume_text, preferences)
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = response.content[0].text.strip()
+        # Strip markdown code fences if present
+        if text.startswith("```"):
+            text = re.sub(r"^```\w*\n?", "", text)
+            text = re.sub(r"\n?```$", "", text)
+        ranking = json.loads(text)
+    except Exception as e:
+        print(f"WARNING: Claude ranking failed: {e}", file=sys.stderr)
+        return None
+
+    # Reorder results based on Claude's ranking (claude_rank / claude_reason)
+    ranked = []
+    for claude_rank, entry in enumerate(ranking):
+        idx = entry["index"]
+        if 0 <= idx < len(results):
+            item = results[idx].copy()
+            item["claude_rank"] = claude_rank + 1
+            item["claude_reason"] = entry.get("reason", "")
+            # Keep rank_reason for backward compat in output
+            item["rank_reason"] = item["claude_reason"]
+            ranked.append(item)
+
+    # Append any results Claude missed
+    ranked_indices = {entry["index"] for entry in ranking}
+    for i, item in enumerate(results):
+        if i not in ranked_indices:
+            ranked.append(item)
+
+    return ranked
+
+
+# ---------------------------------------------------------------------------
 # HTML email formatting
 # ---------------------------------------------------------------------------
 
@@ -501,7 +595,7 @@ def format_apply_section(parsed):
     return "<br>".join(parts)
 
 
-def format_post_html(parsed, matches, neg_matches=None):
+def format_post_html(parsed, matches, neg_matches=None, rank_reason=None):
     """Format a single post as an HTML block."""
     all_kws = []
     cats = []
@@ -524,6 +618,10 @@ def format_post_html(parsed, matches, neg_matches=None):
         blocked_kws = ", ".join(f'<code>{html.escape(k)}</code>' for k in neg_matches)
         blocked_html = f'<div style="color:#c62828;margin-top:4px">Blocked by: {blocked_kws}</div>'
 
+    reason_html = ""
+    if rank_reason:
+        reason_html = f'<div style="color:#1b5e20;font-size:0.9em;margin-bottom:6px;font-style:italic">{html.escape(rank_reason)}</div>'
+
     return f"""
     <div style="border:1px solid #e0e0e0;border-radius:8px;padding:16px;margin-bottom:12px;background:#fff">
         <div style="margin-bottom:8px">
@@ -532,6 +630,7 @@ def format_post_html(parsed, matches, neg_matches=None):
             {f' &mdash; {location}' if location else ""}
             {remote_tag}
         </div>
+        {reason_html}
         <div style="color:#444;font-size:0.95em;margin-bottom:8px;line-height:1.5">{snippet_highlighted}</div>
         <div style="margin-bottom:6px"><strong>Matched:</strong> {kw_list}</div>
         {blocked_html}
@@ -548,7 +647,8 @@ def build_email_html(results, filtered_out, thread_titles):
     posts_html = ""
     if results:
         for item in results:
-            posts_html += format_post_html(item["parsed"], item["matches"])
+            posts_html += format_post_html(item["parsed"], item["matches"],
+                                           rank_reason=item.get("rank_reason"))
     else:
         posts_html = '<p style="color:#999;text-align:center">No matching posts found.</p>'
 
@@ -618,6 +718,8 @@ def print_results(results, filtered_out):
 
         print(f"\n[{cats}] (score: {item['score']})")
         print(f"  {parsed['company']}{loc}{remote}")
+        if item.get("rank_reason"):
+            print(f"  Rank reason: {item['rank_reason']}")
         print(f"  Matched: {kws}")
 
         for entry in parsed["job_board_urls"]:
@@ -652,6 +754,7 @@ def main():
     parser.add_argument("--no-email", action="store_true", help="Print to terminal only")
     parser.add_argument("--dry-run", action="store_true", help="Save HTML preview locally")
     parser.add_argument("--resume", metavar="PDF", help="Path to PDF resume for context")
+    parser.add_argument("--no-rank", action="store_true", help="Skip Claude AI ranking")
     args = parser.parse_args()
 
     # Load optional config
@@ -742,6 +845,17 @@ def main():
     filtered_out.sort(key=lambda x: x["score"], reverse=True)
 
     print(f"\n{len(results)} matching posts, {len(filtered_out)} filtered out")
+
+    # Claude ranking
+    if not args.no_rank and results:
+        rank_config = {
+            "resume_text": resume_text,
+            "preferences": (config or {}).get("preferences"),
+        }
+        ranked = rank_jobs_with_claude(results, rank_config)
+        if ranked is not None:
+            results = ranked
+            print(f"Jobs ranked by Claude ({len(results)} posts)")
 
     # Output
     if args.no_email:
