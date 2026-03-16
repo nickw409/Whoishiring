@@ -370,20 +370,20 @@ def update_config(
     """Update config.yaml settings. Only provided fields are changed; others are preserved.
 
     Use this to adjust preferences, resume path, or WAAS search filters.
-    Pass null/None to remove a WAAS filter (revert to default).
+    Pass "any" to clear/disable a WAAS filter. Omit a field to leave it unchanged.
 
     Args:
         resume: Path to PDF resume file for ranking.
         remote_preference: Remote work preference (e.g. "preferred", "required", "flexible").
         preference_notes: Free-form notes about what you're looking for, sent to the ranker.
-        waas_role: WAAS role filter. Values: eng, sales, operations, marketing, product.
-        waas_eng_type: WAAS engineering type. Values: fs, be, ml, fe, eng_mgmt, devops, embedded.
-        waas_remote: WAAS remote filter. Values: yes, only, no.
-        waas_job_type: WAAS job type. Values: fulltime, intern, contract, cofounder.
-        waas_min_experience: WAAS min experience. Values: 0, 1, 3, 6, 11.
-        waas_us_visa_required: WAAS visa filter. Values: yes, none, possible.
-        waas_has_salary: WAAS salary listed filter. Values: true, false.
-        waas_company_waas_stage: WAAS company stage. Values: seed, series_a, growth, scale.
+        waas_role: WAAS role filter. Values: eng, sales, operations, marketing, product, or "any" to disable.
+        waas_eng_type: WAAS engineering type. Values: fs, be, ml, fe, eng_mgmt, devops, embedded, or "any" to disable.
+        waas_remote: WAAS remote filter. Values: yes, only, no, or "any" to disable.
+        waas_job_type: WAAS job type. Values: fulltime, intern, contract, cofounder, or "any" to disable.
+        waas_min_experience: WAAS min experience. Values: 0, 1, 3, 6, 11, or "any" to disable.
+        waas_us_visa_required: WAAS visa filter. Values: yes, none, possible, or "any" to disable.
+        waas_has_salary: WAAS salary listed filter. Values: true, false, or "any" to disable.
+        waas_company_waas_stage: WAAS company stage. Values: seed, series_a, growth, scale, or "any" to disable.
     """
     import yaml
 
@@ -424,8 +424,8 @@ def update_config(
     if waas_updates:
         waas_config = config.get("waas", {}) or {}
         for key, value in waas_updates.items():
-            if value == "none" and key != "us_visa_required":
-                # "none" means remove the filter (except us_visa_required where it's a valid value)
+            if value.lower() == "any":
+                # "any" means clear/disable the filter
                 waas_config.pop(key, None)
             else:
                 waas_config[key] = value

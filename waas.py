@@ -56,7 +56,10 @@ def _load_waas_filters() -> dict:
                 for key in WAAS_DEFAULT_FILTERS:
                     if key in waas_config:
                         val = waas_config[key]
-                        filters[key] = str(val) if val is not None else None
+                        if val is None or str(val).lower() == "any" or str(val).strip() == "":
+                            filters[key] = None
+                        else:
+                            filters[key] = str(val)
         except Exception:
             logger.debug("Could not load waas filters from config.yaml")
 
@@ -67,7 +70,7 @@ def _build_algolia_filter_string(filters: dict) -> str:
     """Build an Algolia filter string from the filters dict."""
     parts = []
     for key, value in filters.items():
-        if value is None:
+        if not value or value == "any":
             continue
         parts.append(f"({key}:{value})")
 
