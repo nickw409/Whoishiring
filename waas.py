@@ -89,6 +89,16 @@ def _create_browser():
 # Scraper
 # ---------------------------------------------------------------------------
 
+def _is_in_asyncio_loop() -> bool:
+    """Check if we're inside a running asyncio event loop."""
+    import asyncio
+    try:
+        asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
+
+
 def scrape_waas_jobs(ignore_seen: bool = False) -> list[dict[str, Any]]:
     """Scrape engineering jobs from workatastartup.com.
 
@@ -100,6 +110,42 @@ def scrape_waas_jobs(ignore_seen: bool = False) -> list[dict[str, Any]]:
     company_size, company_yc_batch, waas_company_url, job_title, job_url,
     job_salary_range, job_location, job_tags, job_details, job_description, remote.
     """
+    # Playwright sync API can't run inside asyncio (e.g. MCP server).
+    # Shell out to ourselves as a subprocess in that case.
+    if _is_in_asyncio_loop():
+        return _scrape_via_subprocess(ignore_seen)
+
+    return _scrape_direct(ignore_seen)
+
+
+def _scrape_via_subprocess(ignore_seen: bool) -> list[dict[str, Any]]:
+    """Run the scraper in a subprocess to avoid asyncio conflicts."""
+    import subprocess
+    import sys
+
+    args = [sys.executable, __file__]
+    if ignore_seen:
+        args.append("--ignore-seen")
+
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        logger.warning("WAAS subprocess timed out")
+        return []
+
+    if result.returncode != 0:
+        logger.warning("WAAS subprocess failed: %s", result.stderr)
+        return []
+
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        logger.warning("WAAS subprocess returned invalid JSON: %s", result.stdout[:200])
+        return []
+
+
+def _scrape_direct(ignore_seen: bool) -> list[dict[str, Any]]:
+    """Scrape directly using Playwright sync API (not inside asyncio)."""
     seen = load_waas_seen()
     prune_waas_seen(seen)
 
@@ -231,7 +277,7 @@ def scrape_waas_jobs(ignore_seen: bool = False) -> list[dict[str, Any]]:
                 continue
 
     except Exception as e:
-        logger.warning("WAAS scraping failed: %s", e)
+        logger.warning("WAAS scraping failed: %s", e, exc_info=True)
         return []
     finally:
         if browser is not None:
@@ -375,10 +421,12 @@ def scan_and_filter_waas(ignore_seen: bool = False, hn_company_names: set[str] |
 if __name__ == "__main__":
     import sys
 
+    ignore_seen = "--ignore-seen" in sys.argv
+
     try:
-        jobs = scrape_waas_jobs(ignore_seen=True)
-        print(json.dumps(jobs, indent=2))
-        print(f"\n{len(jobs)} jobs scraped", file=sys.stderr)
+        jobs = _scrape_direct(ignore_seen)
+        print(json.dumps(jobs))
+        print(f"{len(jobs)} jobs scraped", file=sys.stderr)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

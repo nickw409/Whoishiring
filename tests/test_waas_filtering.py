@@ -686,3 +686,170 @@ class TestScanAndFilterWaas:
         monkeypatch.setattr("waas.scrape_waas_jobs", lambda **kw: (_ for _ in ()).throw(RuntimeError("boom")))
         with pytest.raises(RuntimeError):
             scan_and_filter_waas()
+
+
+# ---------------------------------------------------------------------------
+# Asyncio / subprocess fallback
+# ---------------------------------------------------------------------------
+
+class TestAsyncioFallback:
+    def test_detects_asyncio_loop(self):
+        """_is_in_asyncio_loop returns True inside a running loop."""
+        import asyncio
+        from waas import _is_in_asyncio_loop
+
+        result = None
+        async def check():
+            nonlocal result
+            result = _is_in_asyncio_loop()
+
+        asyncio.run(check())
+        assert result is True
+
+    def test_not_in_asyncio_outside_loop(self):
+        """_is_in_asyncio_loop returns False when no loop is running."""
+        from waas import _is_in_asyncio_loop
+        assert _is_in_asyncio_loop() is False
+
+    def test_subprocess_fallback_in_asyncio(self, monkeypatch):
+        """scrape_waas_jobs uses subprocess when inside asyncio loop."""
+        import asyncio
+        from waas import scrape_waas_jobs
+
+        called = {"subprocess": False, "direct": False}
+
+        def mock_subprocess(ignore_seen):
+            called["subprocess"] = True
+            return [{"mock": True}]
+
+        def mock_direct(ignore_seen):
+            called["direct"] = True
+            return [{"mock": True}]
+
+        monkeypatch.setattr("waas._scrape_via_subprocess", mock_subprocess)
+        monkeypatch.setattr("waas._scrape_direct", mock_direct)
+
+        async def run():
+            return scrape_waas_jobs(ignore_seen=True)
+
+        result = asyncio.run(run())
+        assert called["subprocess"] is True
+        assert called["direct"] is False
+        assert result == [{"mock": True}]
+
+    def test_direct_outside_asyncio(self, monkeypatch):
+        """scrape_waas_jobs uses direct path when not in asyncio."""
+        from waas import scrape_waas_jobs
+
+        called = {"subprocess": False, "direct": False}
+
+        def mock_subprocess(ignore_seen):
+            called["subprocess"] = True
+            return []
+
+        def mock_direct(ignore_seen):
+            called["direct"] = True
+            return [{"mock": True}]
+
+        monkeypatch.setattr("waas._scrape_via_subprocess", mock_subprocess)
+        monkeypatch.setattr("waas._scrape_direct", mock_direct)
+
+        result = scrape_waas_jobs(ignore_seen=True)
+        assert called["direct"] is True
+        assert called["subprocess"] is False
+
+    def test_subprocess_passes_ignore_seen_flag(self, monkeypatch):
+        """--ignore-seen flag is passed to subprocess."""
+        import subprocess as sp
+        from waas import _scrape_via_subprocess
+
+        captured_args = {}
+
+        def mock_run(args, **kwargs):
+            captured_args["args"] = args
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = "[]"
+            result.stderr = ""
+            return result
+
+        monkeypatch.setattr("subprocess.run", mock_run)
+        _scrape_via_subprocess(ignore_seen=True)
+        assert "--ignore-seen" in captured_args["args"]
+
+    def test_subprocess_omits_flag_when_false(self, monkeypatch):
+        """--ignore-seen flag is not passed when ignore_seen=False."""
+        import subprocess as sp
+        from waas import _scrape_via_subprocess
+
+        captured_args = {}
+
+        def mock_run(args, **kwargs):
+            captured_args["args"] = args
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = "[]"
+            result.stderr = ""
+            return result
+
+        monkeypatch.setattr("subprocess.run", mock_run)
+        _scrape_via_subprocess(ignore_seen=False)
+        assert "--ignore-seen" not in captured_args["args"]
+
+    def test_subprocess_returns_parsed_json(self, monkeypatch):
+        """Subprocess output is parsed as JSON."""
+        from waas import _scrape_via_subprocess
+
+        def mock_run(args, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = '[{"company_name": "Test", "job_title": "Eng"}]'
+            result.stderr = ""
+            return result
+
+        monkeypatch.setattr("subprocess.run", mock_run)
+        jobs = _scrape_via_subprocess(ignore_seen=True)
+        assert len(jobs) == 1
+        assert jobs[0]["company_name"] == "Test"
+
+    def test_subprocess_failure_returns_empty(self, monkeypatch):
+        """Subprocess failure returns empty list."""
+        from waas import _scrape_via_subprocess
+
+        def mock_run(args, **kwargs):
+            result = MagicMock()
+            result.returncode = 1
+            result.stdout = ""
+            result.stderr = "crash"
+            return result
+
+        monkeypatch.setattr("subprocess.run", mock_run)
+        jobs = _scrape_via_subprocess(ignore_seen=True)
+        assert jobs == []
+
+    def test_subprocess_invalid_json_returns_empty(self, monkeypatch):
+        """Subprocess returning invalid JSON returns empty list."""
+        from waas import _scrape_via_subprocess
+
+        def mock_run(args, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = "not json{{"
+            result.stderr = ""
+            return result
+
+        monkeypatch.setattr("subprocess.run", mock_run)
+        jobs = _scrape_via_subprocess(ignore_seen=True)
+        assert jobs == []
+
+    def test_subprocess_timeout_returns_empty(self, monkeypatch):
+        """Subprocess timeout returns empty list."""
+        import subprocess as sp
+        from waas import _scrape_via_subprocess
+
+        def mock_run(args, **kwargs):
+            raise sp.TimeoutExpired(args, 300)
+
+        monkeypatch.setattr("subprocess.run", mock_run)
+        jobs = _scrape_via_subprocess(ignore_seen=True)
+        assert jobs == []

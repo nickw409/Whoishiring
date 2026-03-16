@@ -194,6 +194,8 @@ def scan_all(ignore_seen: bool = False, months: int = 1) -> str:
         ignore_seen: If true, return all jobs even if previously seen.
         months: Number of HN monthly threads to scan (1-3).
     """
+    errors = []
+
     # Pass 1: scrape both sources in parallel
     with ThreadPoolExecutor(max_workers=2) as pool:
         hn_future = pool.submit(_scan_hn, months, ignore_seen)
@@ -201,13 +203,15 @@ def scan_all(ignore_seen: bool = False, months: int = 1) -> str:
 
         try:
             hn_results, hn_filtered, thread_titles = hn_future.result()
-        except Exception:
+        except Exception as e:
             hn_results, hn_filtered, thread_titles = [], [], []
+            errors.append(f"HN scan failed: {e}")
 
         try:
             waas_raw = waas_future.result()
-        except Exception:
+        except Exception as e:
             waas_raw = []
+            errors.append(f"WAAS scrape failed: {e}")
 
     # Pass 2: dedup WAAS against HN companies, then filter
     hn_company_names = set()
@@ -218,22 +222,28 @@ def scan_all(ignore_seen: bool = False, months: int = 1) -> str:
 
     try:
         waas_results, waas_filtered = waas.filter_waas_jobs(waas_raw, hn_company_names=hn_company_names)
-    except Exception:
+    except Exception as e:
         waas_results, waas_filtered = [], []
+        errors.append(f"WAAS filter failed: {e}")
 
     # Combine and sort by score descending
     combined = _format_hn_results(hn_results) + _format_waas_results(waas_results)
     combined.sort(key=lambda x: x.get("score", 0), reverse=True)
 
-    return json.dumps({
+    result = {
         "sources": ["hn", "waas"],
         "threads": thread_titles,
         "total_results": len(combined),
         "total_filtered": len(hn_filtered) + len(waas_filtered),
         "hn_results": len(hn_results),
         "waas_results": len(waas_results),
+        "waas_raw_scraped": len(waas_raw),
         "results": combined,
-    }, indent=2)
+    }
+    if errors:
+        result["errors"] = errors
+
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
