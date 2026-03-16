@@ -76,57 +76,70 @@ for _kw in NEGATIVE_KEYWORDS:
     _neg_patterns[_kw] = re.compile(r"\b" + _escaped + r"\b", re.IGNORECASE)
 
 # ---------------------------------------------------------------------------
-# Config loading
+# Config loading & resume extraction
 # ---------------------------------------------------------------------------
 
-def load_config(path=None):
-    """Load config from YAML file. Returns None if file doesn't exist."""
-    p = Path(path) if path else CONFIG_FILE
+def extract_resume_text(path):
+    """Extract plain text from a PDF file using pymupdf."""
+    p = Path(path)
     if not p.exists():
-        return None
-    with open(p) as f:
-        return yaml.safe_load(f)
-
-
-def apply_config(config):
-    """Apply loaded config to global settings."""
-    global KEYWORD_CATEGORIES, NEGATIVE_KEYWORDS, _kw_patterns, _neg_patterns
-
-    if not config:
-        return
-
-    if "keyword_categories" in config:
-        KEYWORD_CATEGORIES = config["keyword_categories"]
-        _kw_patterns.clear()
-        for cat, info in KEYWORD_CATEGORIES.items():
-            for kw in info["keywords"]:
-                _escaped = re.escape(kw)
-                _kw_patterns[kw] = re.compile(r"\b" + _escaped + r"\b", re.IGNORECASE)
-
-    if "negative_keywords" in config:
-        NEGATIVE_KEYWORDS = config["negative_keywords"]
-        _neg_patterns.clear()
-        for kw in NEGATIVE_KEYWORDS:
-            _escaped = re.escape(kw)
-            _neg_patterns[kw] = re.compile(r"\b" + _escaped + r"\b", re.IGNORECASE)
-
-
-# ---------------------------------------------------------------------------
-# Resume text extraction
-# ---------------------------------------------------------------------------
-
-def extract_resume_text(pdf_path):
-    """Extract plain text from a PDF resume using PyMuPDF."""
-    path = Path(pdf_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Resume not found: {pdf_path}")
-    doc = fitz.open(str(path))
+        print(f"ERROR: Resume file not found: {p}", file=sys.stderr)
+        sys.exit(1)
+    doc = fitz.open(str(p))
     text = ""
     for page in doc:
         text += page.get_text()
     doc.close()
     return text.strip()
 
+
+def load_config(resume_override=None):
+    """Load config from config.yaml. Returns dict with 'resume_text' and 'preferences'."""
+    config = {}
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE) as f:
+            config = yaml.safe_load(f) or {}
+
+    resume_path = resume_override or config.get("resume")
+    resume_text = None
+    if resume_path:
+        resume_text = extract_resume_text(resume_path)
+
+    return {
+        "resume_text": resume_text,
+        "preferences": config.get("preferences", {}),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Location filtering
+# ---------------------------------------------------------------------------
+
+_NON_US_RE = re.compile(
+    r"\b(london|berlin|munich|hamburg|frankfurt|paris|amsterdam|rotterdam"
+    r"|barcelona|madrid|rome|milan|zurich|vienna|warsaw|prague|stockholm"
+    r"|oslo|copenhagen|helsinki|brussels|lisbon|dublin|budapest|bucharest"
+    r"|toronto|vancouver|montreal|calgary|ottawa"
+    r"|sydney|melbourne|brisbane|perth"
+    r"|singapore|tokyo|osaka|seoul|beijing|shanghai|hong kong|shenzhen"
+    r"|bangalore|bengaluru|mumbai|delhi|hyderabad|pune"
+    r"|tel aviv|istanbul|dubai|abu dhabi"
+    r"|uk|united kingdom|england|scotland|wales"
+    r"|canada|germany|france|spain|italy|netherlands|sweden|norway|denmark"
+    r"|finland|switzerland|austria|belgium|poland|czech|portugal|ireland"
+    r"|australia|new zealand|japan|china|india|south korea"
+    r"|israel|turkey|uae|brazil|mexico|argentina"
+    r"|europe|emea|apac|latam)\b",
+    re.IGNORECASE,
+)
+
+_US_RE = re.compile(
+    r"\b(usa|united states|new york|nyc|san francisco|los angeles|chicago"
+    r"|seattle|boston|austin|denver|atlanta|miami|dallas|houston|portland"
+    r"|phoenix|san diego|minneapolis|detroit|baltimore|washington dc"
+    r"|bay area|silicon valley|,\s*[A-Z]{2})\b",
+    re.IGNORECASE,
+)
 
 # ---------------------------------------------------------------------------
 # HN API helpers
@@ -217,6 +230,18 @@ def match_keywords(text):
 def match_negative(text):
     """Return list of matched negative keywords."""
     return [kw for kw, pat in _neg_patterns.items() if pat.search(text)]
+
+
+def is_outside_us(parsed):
+    """Return True if the job is clearly located outside the US and not remote."""
+    if parsed["remote"]:
+        return False
+    location = parsed["location"]
+    if not location:
+        return False
+    if _US_RE.search(location):
+        return False
+    return bool(_NON_US_RE.search(location))
 
 
 def score_matches(matches):
@@ -470,14 +495,22 @@ def build_ranking_prompt(results, resume_text, preferences):
         p = item["parsed"]
         jobs_payload.append({
             "index": i,
+            "id": p["id"],
             "company": p["company"],
             "location": p["location"],
             "remote": p["remote"],
-            "snippet": p["snippet"],
+            "full_text": p["full_text"],
             "matched_categories": list(item["matches"].keys()),
             "matched_keywords": [kw for kws in item["matches"].values() for kw in kws],
             "score": item["score"],
         })
+
+    prefs_str = ""
+    if preferences:
+        if preferences.get("remote"):
+            prefs_str += f"Remote preference: {preferences['remote']}\n"
+        if preferences.get("notes"):
+            prefs_str += f"{preferences['notes']}\n"
 
     return f"""You are a job matching assistant. Given a candidate's resume and preferences, rank these job postings from best to worst fit.
 
@@ -485,7 +518,7 @@ RESUME:
 {resume_text}
 
 PREFERENCES:
-{preferences if preferences else "No specific preferences provided."}
+{prefs_str if prefs_str else "No specific preferences provided."}
 
 JOB POSTINGS:
 {json.dumps(jobs_payload, indent=2)}
@@ -498,18 +531,15 @@ Order the array from best fit (first) to worst fit (last). Include ALL jobs.
 Return ONLY the JSON array, no other text."""
 
 
-def rank_jobs_with_claude(results, config):
-    """Rank jobs using Claude API. Returns reordered results list, or None on failure."""
+CLAUDE_MODEL = "claude-opus-4-6"
+
+
+def rank_jobs_with_claude(results, resume_text, preferences):
+    """Rank jobs using Claude. Returns re-ordered results list with claude_rank and claude_reason."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        print("WARNING: ANTHROPIC_API_KEY not set, skipping Claude ranking", file=sys.stderr)
-        return None
-
-    resume_text = config["resume_text"]
-    preferences = config["preferences"]
-    if not resume_text:
-        print("No resume loaded, skipping Claude ranking")
-        return None
+        print("WARNING: ANTHROPIC_API_KEY not set, skipping ranking", file=sys.stderr)
+        return results
 
     import anthropic
 
@@ -518,34 +548,33 @@ def rank_jobs_with_claude(results, config):
     try:
         client = anthropic.Anthropic(api_key=api_key)
         response = client.messages.create(
-            model="claude-opus-4-6",
-            max_tokens=4096,
+            model=CLAUDE_MODEL,
+            max_tokens=16000,
+            system="You are a job matching assistant. Analyze the candidate's resume and preferences, then rank every job by fit. Return ONLY valid JSON.",
             messages=[{"role": "user", "content": prompt}],
         )
         text = response.content[0].text.strip()
-        # Strip markdown code fences if present
         if text.startswith("```"):
             text = re.sub(r"^```\w*\n?", "", text)
             text = re.sub(r"\n?```$", "", text)
         ranking = json.loads(text)
     except Exception as e:
-        print(f"WARNING: Claude ranking failed: {e}", file=sys.stderr)
-        return None
+        print(f"WARNING: Ranking failed: {e}", file=sys.stderr)
+        return results
 
-    # Reorder results based on Claude's ranking (claude_rank / claude_reason)
+    # Reorder results by Claude's ranking
     ranked = []
+    ranked_indices = set()
     for claude_rank, entry in enumerate(ranking):
-        idx = entry["index"]
-        if 0 <= idx < len(results):
+        idx = entry.get("index")
+        if idx is not None and 0 <= idx < len(results):
             item = results[idx].copy()
             item["claude_rank"] = claude_rank + 1
             item["claude_reason"] = entry.get("reason", "")
-            # Keep rank_reason for backward compat in output
-            item["rank_reason"] = item["claude_reason"]
             ranked.append(item)
+            ranked_indices.add(idx)
 
-    # Append any results Claude missed
-    ranked_indices = {entry["index"] for entry in ranking}
+    # Append any jobs Claude missed, preserving score order
     for i, item in enumerate(results):
         if i not in ranked_indices:
             ranked.append(item)
@@ -595,7 +624,7 @@ def format_apply_section(parsed):
     return "<br>".join(parts)
 
 
-def format_post_html(parsed, matches, neg_matches=None, rank_reason=None):
+def format_post_html(parsed, matches, neg_matches=None, claude_rank=None, claude_reason=None):
     """Format a single post as an HTML block."""
     all_kws = []
     cats = []
@@ -613,19 +642,23 @@ def format_post_html(parsed, matches, neg_matches=None, rank_reason=None):
 
     hn_link = f'https://news.ycombinator.com/item?id={parsed["id"]}'
 
+    rank_badge = ""
+    if claude_rank is not None:
+        rank_badge = f'<span style="background:#1a73e8;color:#fff;padding:2px 8px;border-radius:4px;font-size:0.85em;font-weight:700">#{claude_rank}</span> '
+
     blocked_html = ""
     if neg_matches:
         blocked_kws = ", ".join(f'<code>{html.escape(k)}</code>' for k in neg_matches)
         blocked_html = f'<div style="color:#c62828;margin-top:4px">Blocked by: {blocked_kws}</div>'
 
     reason_html = ""
-    if rank_reason:
-        reason_html = f'<div style="color:#1b5e20;font-size:0.9em;margin-bottom:6px;font-style:italic">{html.escape(rank_reason)}</div>'
+    if claude_reason:
+        reason_html = f'<div style="color:#555;font-style:italic;margin-bottom:6px">{html.escape(claude_reason)}</div>'
 
     return f"""
     <div style="border:1px solid #e0e0e0;border-radius:8px;padding:16px;margin-bottom:12px;background:#fff">
         <div style="margin-bottom:8px">
-            <span style="background:#e3f2fd;padding:3px 8px;border-radius:4px;font-size:0.85em;font-weight:600">{html.escape(cat_label)}</span>
+            {rank_badge}<span style="background:#e3f2fd;padding:3px 8px;border-radius:4px;font-size:0.85em;font-weight:600">{html.escape(cat_label)}</span>
             <strong style="font-size:1.1em;margin-left:8px">{html.escape(parsed["company"])}</strong>
             {f' &mdash; {location}' if location else ""}
             {remote_tag}
@@ -647,8 +680,11 @@ def build_email_html(results, filtered_out, thread_titles):
     posts_html = ""
     if results:
         for item in results:
-            posts_html += format_post_html(item["parsed"], item["matches"],
-                                           rank_reason=item.get("rank_reason"))
+            posts_html += format_post_html(
+                item["parsed"], item["matches"],
+                claude_rank=item.get("claude_rank"),
+                claude_reason=item.get("claude_reason"),
+            )
     else:
         posts_html = '<p style="color:#999;text-align:center">No matching posts found.</p>'
 
@@ -716,10 +752,11 @@ def print_results(results, filtered_out):
         remote = " | Remote" if parsed["remote"] else ""
         loc = f" | {parsed['location']}" if parsed["location"] else ""
 
-        print(f"\n[{cats}] (score: {item['score']})")
+        rank_prefix = f"#{item['claude_rank']} " if item.get("claude_rank") else ""
+        print(f"\n{rank_prefix}[{cats}] (score: {item['score']})")
         print(f"  {parsed['company']}{loc}{remote}")
-        if item.get("rank_reason"):
-            print(f"  Rank reason: {item['rank_reason']}")
+        if item.get("claude_reason"):
+            print(f"  {item['claude_reason']}")
         print(f"  Matched: {kws}")
 
         for entry in parsed["job_board_urls"]:
@@ -754,26 +791,20 @@ def main():
     parser.add_argument("--no-email", action="store_true", help="Print to terminal only")
     parser.add_argument("--dry-run", action="store_true", help="Save HTML preview locally")
     parser.add_argument("--resume", metavar="PDF", help="Path to PDF resume for context")
-    parser.add_argument("--no-rank", action="store_true", help="Skip Claude AI ranking")
+    parser.add_argument("--no-rank", action="store_true", help="Skip ranking")
     args = parser.parse_args()
 
-    # Load optional config
-    config = load_config()
-    if config:
-        apply_config(config)
-
-    # Load optional resume
-    resume_text = None
-    if args.resume:
-        resume_text = extract_resume_text(args.resume)
-        print(f"Loaded resume ({len(resume_text)} chars)")
+    config = load_config(resume_override=args.resume)
+    if config["resume_text"]:
+        print(f"Resume loaded ({len(config['resume_text'])} chars)")
+    if config["preferences"]:
+        print(f"Preferences loaded from config.yaml")
 
     need_email = not args.no_email and not args.dry_run
     if need_email:
-        email_cfg = (config or {}).get("email", {})
-        email_to = os.environ.get("HN_JOBS_EMAIL_TO") or email_cfg.get("to")
-        email_from = os.environ.get("HN_JOBS_EMAIL_FROM") or email_cfg.get("from")
-        email_pass = os.environ.get("HN_JOBS_EMAIL_PASSWORD") or email_cfg.get("password")
+        email_to = os.environ.get("HN_JOBS_EMAIL_TO")
+        email_from = os.environ.get("HN_JOBS_EMAIL_FROM")
+        email_pass = os.environ.get("HN_JOBS_EMAIL_PASSWORD")
         if not all([email_to, email_from, email_pass]):
             print("ERROR: Set HN_JOBS_EMAIL_TO, HN_JOBS_EMAIL_FROM, HN_JOBS_EMAIL_PASSWORD", file=sys.stderr)
             print("Or use --no-email / --dry-run", file=sys.stderr)
@@ -837,6 +868,9 @@ def main():
             if neg:
                 item["neg_matches"] = neg
                 filtered_out.append(item)
+            elif is_outside_us(parsed):
+                item["neg_matches"] = ["non-US location"]
+                filtered_out.append(item)
             else:
                 results.append(item)
 
@@ -846,16 +880,11 @@ def main():
 
     print(f"\n{len(results)} matching posts, {len(filtered_out)} filtered out")
 
-    # Claude ranking
-    if not args.no_rank and results:
-        rank_config = {
-            "resume_text": resume_text,
-            "preferences": (config or {}).get("preferences"),
-        }
-        ranked = rank_jobs_with_claude(results, rank_config)
-        if ranked is not None:
-            results = ranked
-            print(f"Jobs ranked by Claude ({len(results)} posts)")
+    # Rank with Claude if resume is available
+    if config["resume_text"] and not args.no_rank and results:
+        print("Ranking jobs with Claude...")
+        results = rank_jobs_with_claude(results, config["resume_text"], config["preferences"])
+        print("Ranking complete")
 
     # Output
     if args.no_email:

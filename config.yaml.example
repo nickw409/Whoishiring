@@ -1,53 +1,6 @@
-# HN Who's Hiring Job Scanner — Configuration
-# Copy to config.yaml and customize.
-
-# Email settings (can also use env vars: HN_JOBS_EMAIL_TO, HN_JOBS_EMAIL_FROM, HN_JOBS_EMAIL_PASSWORD)
-email:
-  to: ""
-  from: ""
-  password: ""  # Gmail app password
-
-# Keyword categories with weights
-keyword_categories:
-  AI tooling:
-    weight: 3
-    keywords:
-      - claude code
-      - copilot
-      - cursor
-      - ai-assisted
-      - ai tools
-      - ai coding
-      - agentic
-      - llm
-      - ai engineer
-  Systems:
-    weight: 2
-    keywords:
-      - rust
-      - cuda
-      - gpu
-      - simd
-      - high-performance
-      - hpc
-      - systems programming
-  General AI+SWE:
-    weight: 1
-    keywords:
-      - machine learning
-      - tensorflow
-      - pytorch
-      - deep learning
-      - computer vision
-      - ml engineer
-      - ai/ml
-
-# Negative filter keywords
-negative_keywords:
-  - staff engineer
-  - principal engineer
-  - engineering manager
-  - director of
-  - vp of
-  - 10+ years
-  - 15+ years
+resume: resume.pdf
+preferences:
+  remote: preferred
+  notes: |
+    I prefer early-stage startups. Looking to work with Rust or Python.
+    Not interested in fintech.
