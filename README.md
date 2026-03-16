@@ -178,6 +178,9 @@ The MCP server registers prompt templates (`find_jobs`, `rerank_results`, `scan_
 **YC startups only:**
 > Use scan_waas with ignore_seen=true to find engineering jobs from YC startups. Get my resume and rank the results by fit.
 
+**YC startups deep scan with artifact:**
+> Scan YC startups for jobs matching my resume. Use get_resume and get_preferences first, then scan_waas with ignore_seen=true. If results overflow, split by eng_type and combine. Filter out non-code roles and internships. Rank your top 20 by fit against my resume. For each, show company, YC batch, job title, salary, location, remote status, and a detailed explanation connecting my resume to the job. Include the WAAS job URL. Put it all in an artifact.
+
 **Targeted search:**
 > Scan for jobs, get my resume, and find roles that specifically mention Rust or systems programming. Which ones would be the best fit?
 
