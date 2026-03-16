@@ -53,6 +53,12 @@ preferences:
 - `HN_JOBS_EMAIL_FROM`
 - `HN_JOBS_EMAIL_PASSWORD` (Gmail app password)
 
+**For full WAAS access (optional):**
+- `WAAS_USERNAME` — YC account username or email
+- `WAAS_PASSWORD` — YC account password
+
+Without these, WAAS scraping is limited to ~30 jobs. With credentials, all engineering listings are accessible.
+
 ## CLI Usage
 
 ```bash

@@ -3,6 +3,7 @@
 
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -16,8 +17,10 @@ logger = logging.getLogger(__name__)
 
 WAAS_JOBS_URL = "https://www.workatastartup.com/jobs?role=eng"
 WAAS_BASE_URL = "https://www.workatastartup.com"
+WAAS_AUTH_URL = "https://account.ycombinator.com/authenticate?continue=https%3A%2F%2Fwww.workatastartup.com%2Fjobs%3Frole%3Deng"
 WAAS_SEEN_FILE = Path(__file__).parent / "seen_waas.json"
 WAAS_PRUNE_DAYS = 180
+WAAS_UNAUTH_LIMIT = 30  # max jobs visible without login
 
 # ---------------------------------------------------------------------------
 # DOM selectors (discovered from live page inspection)
@@ -83,6 +86,38 @@ def _create_browser():
     playwright = sync_playwright().start()
     browser = playwright.chromium.launch(headless=True)
     return playwright, browser
+
+
+def _waas_login(page) -> bool:
+    """Attempt to log in to WAAS via YC auth. Returns True if successful.
+
+    Requires WAAS_USERNAME and WAAS_PASSWORD env vars. If not set, skips
+    login and returns False (unauthenticated scraping, limited to ~30 jobs).
+    """
+    username = os.environ.get("WAAS_USERNAME", "")
+    password = os.environ.get("WAAS_PASSWORD", "")
+
+    if not username or not password:
+        return False
+
+    logger.info("Attempting WAAS login...")
+    page.goto(WAAS_AUTH_URL, timeout=30000)
+    page.wait_for_selector('input[name="username"]', timeout=10000)
+
+    page.fill('input[name="username"]', username)
+    page.fill('input[name="password"]', password)
+    page.click('button:has-text("Log in")')
+
+    # Wait for navigation — either redirect to jobs page or stay on auth
+    page.wait_for_timeout(3000)
+    current_url = page.url
+
+    if "account.ycombinator.com" in current_url:
+        logger.warning("WAAS login failed — still on auth page. Check WAAS_USERNAME/WAAS_PASSWORD.")
+        return False
+
+    logger.info("WAAS login successful")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +191,13 @@ def _scrape_direct(ignore_seen: bool) -> list[dict[str, Any]]:
     try:
         playwright, browser = _create_browser()
         page = browser.new_page()
-        page.goto(WAAS_JOBS_URL, timeout=30000)
+
+        # Authenticate if credentials are available
+        authenticated = _waas_login(page)
+
+        # Navigate to jobs page (login may have already redirected there)
+        if WAAS_JOBS_URL not in page.url:
+            page.goto(WAAS_JOBS_URL, timeout=30000)
         page.wait_for_selector("div.job-name", timeout=15000)
 
         # Scroll to load all results
@@ -245,6 +286,13 @@ def _scrape_direct(ignore_seen: bool) -> list[dict[str, Any]]:
             except Exception:
                 logger.warning("Failed to parse a job card, skipping", exc_info=True)
                 continue
+
+        if not authenticated and len(jobs) >= WAAS_UNAUTH_LIMIT:
+            logger.warning(
+                "Only %d jobs found (unauthenticated limit). "
+                "Set WAAS_USERNAME and WAAS_PASSWORD env vars for full results.",
+                len(jobs),
+            )
 
         # Fetch full descriptions from individual job pages
         logger.info("Fetching descriptions for %d jobs...", len(jobs))

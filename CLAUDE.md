@@ -65,6 +65,7 @@ Target domains: Greenhouse, Lever, Ashby. 0.5s politeness delay between requests
 Environment variables:
 - `ANTHROPIC_API_KEY` — for Claude ranking
 - `HN_JOBS_EMAIL_TO`, `HN_JOBS_EMAIL_FROM`, `HN_JOBS_EMAIL_PASSWORD` — for email delivery
+- `WAAS_USERNAME`, `WAAS_PASSWORD` — YC account credentials for full WAAS access (without these, limited to ~30 jobs)
 
 ### Deduplication
 - Track seen HN comment IDs in `seen_posts.json`

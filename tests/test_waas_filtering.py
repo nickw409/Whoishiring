@@ -412,10 +412,12 @@ def _make_mock_page(listing_html=LISTING_HTML, job_html=JOB_PAGE_HTML):
     """Create a mock Playwright page that returns canned HTML."""
     page = MagicMock()
     page.evaluate.return_value = 1000  # scrollHeight never changes (no infinite scroll)
+    page.url = ""  # not on jobs page yet, so _scrape_direct will call goto
 
     call_count = {"goto": 0}
     def goto_side_effect(url, **kwargs):
         call_count["goto"] += 1
+        page.url = url
 
     page.goto.side_effect = goto_side_effect
 
@@ -437,6 +439,8 @@ class TestScrapeWaasJobs:
             page = _make_mock_page()
         mock_browser = MagicMock()
         mock_browser.new_page.return_value = page
+        # Disable auth by default in scraper tests
+        monkeypatch.setattr("waas._waas_login", lambda page: False)
         mock_pw = MagicMock()
 
         def fake_create():
@@ -525,12 +529,14 @@ class TestScrapeWaasJobs:
 
     def test_browser_cleanup_on_navigation_error(self, monkeypatch):
         page = MagicMock()
+        page.url = ""
         page.goto.side_effect = TimeoutError("navigation timeout")
         mock_browser = MagicMock()
         mock_browser.new_page.return_value = page
         mock_pw = MagicMock()
 
         monkeypatch.setattr("waas._create_browser", lambda: (mock_pw, mock_browser))
+        monkeypatch.setattr("waas._waas_login", lambda p: False)
         monkeypatch.setattr("waas.load_waas_seen", lambda: {"jobs": {}})
 
         jobs = scrape_waas_jobs(ignore_seen=True)
@@ -542,10 +548,12 @@ class TestScrapeWaasJobs:
         """If fetching individual job pages fails, keep the listing-page description."""
         page = MagicMock()
         page.evaluate.return_value = 1000
+        page.url = ""
         call_count = {"n": 0}
 
         def goto_effect(url, **kwargs):
             call_count["n"] += 1
+            page.url = url
             if call_count["n"] > 1:
                 raise TimeoutError("job page timeout")
 
@@ -553,6 +561,7 @@ class TestScrapeWaasJobs:
         page.content.return_value = LISTING_HTML
         page.wait_for_selector.return_value = True
         page.wait_for_timeout.return_value = None
+        monkeypatch.setattr("waas._waas_login", lambda p: False)
 
         self._patch_browser(monkeypatch, page=page)
         jobs = scrape_waas_jobs(ignore_seen=True)
@@ -569,6 +578,7 @@ class TestScrapeWaasJobs:
         saved = {}
 
         monkeypatch.setattr("waas._create_browser", lambda: (mock_pw, mock_browser))
+        monkeypatch.setattr("waas._waas_login", lambda p: False)
         monkeypatch.setattr("waas.load_waas_seen", lambda: {
             "jobs": {"https://www.workatastartup.com/jobs/100": time.time()}
         })
@@ -591,6 +601,7 @@ class TestScrapeWaasJobs:
             save_called["count"] += 1
 
         monkeypatch.setattr("waas._create_browser", lambda: (mock_pw, mock_browser))
+        monkeypatch.setattr("waas._waas_login", lambda p: False)
         monkeypatch.setattr("waas.load_waas_seen", lambda: {"jobs": {}})
         monkeypatch.setattr("waas.save_waas_seen", mock_save)
 
@@ -611,6 +622,7 @@ class TestScrapeWaasJobs:
             return mock_pw, mock_browser
 
         monkeypatch.setattr("waas._create_browser", counting_create)
+        monkeypatch.setattr("waas._waas_login", lambda p: False)
         monkeypatch.setattr("waas.load_waas_seen", lambda: {"jobs": {}})
         monkeypatch.setattr("waas.save_waas_seen", lambda s: None)
 
@@ -853,3 +865,201 @@ class TestAsyncioFallback:
         monkeypatch.setattr("subprocess.run", mock_run)
         jobs = _scrape_via_subprocess(ignore_seen=True)
         assert jobs == []
+
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+
+class TestWaasLogin:
+    def test_skips_without_credentials(self, monkeypatch):
+        """No env vars set — returns False without navigating."""
+        from waas import _waas_login
+        monkeypatch.delenv("WAAS_USERNAME", raising=False)
+        monkeypatch.delenv("WAAS_PASSWORD", raising=False)
+        page = MagicMock()
+        result = _waas_login(page)
+        assert result is False
+        page.goto.assert_not_called()
+
+    def test_skips_with_empty_username(self, monkeypatch):
+        from waas import _waas_login
+        monkeypatch.setenv("WAAS_USERNAME", "")
+        monkeypatch.setenv("WAAS_PASSWORD", "secret")
+        page = MagicMock()
+        assert _waas_login(page) is False
+        page.goto.assert_not_called()
+
+    def test_skips_with_empty_password(self, monkeypatch):
+        from waas import _waas_login
+        monkeypatch.setenv("WAAS_USERNAME", "user@test.com")
+        monkeypatch.setenv("WAAS_PASSWORD", "")
+        page = MagicMock()
+        assert _waas_login(page) is False
+        page.goto.assert_not_called()
+
+    def test_successful_login(self, monkeypatch):
+        """Credentials set, redirect to jobs page — returns True."""
+        from waas import _waas_login, WAAS_AUTH_URL
+        monkeypatch.setenv("WAAS_USERNAME", "user@test.com")
+        monkeypatch.setenv("WAAS_PASSWORD", "secret123")
+        page = MagicMock()
+        page.url = "https://www.workatastartup.com/jobs?role=eng"
+        result = _waas_login(page)
+        assert result is True
+        page.goto.assert_called_once_with(WAAS_AUTH_URL, timeout=30000)
+        page.fill.assert_any_call('input[name="username"]', "user@test.com")
+        page.fill.assert_any_call('input[name="password"]', "secret123")
+        page.click.assert_called_once_with('button:has-text("Log in")')
+
+    def test_failed_login_stays_on_auth_page(self, monkeypatch):
+        """Bad credentials — page stays on auth URL, returns False."""
+        from waas import _waas_login
+        monkeypatch.setenv("WAAS_USERNAME", "user@test.com")
+        monkeypatch.setenv("WAAS_PASSWORD", "wrong")
+        page = MagicMock()
+        page.url = "https://account.ycombinator.com/authenticate?continue=..."
+        result = _waas_login(page)
+        assert result is False
+
+    def test_login_timeout_raises(self, monkeypatch):
+        """Auth page fails to load — exception propagates."""
+        from waas import _waas_login
+        monkeypatch.setenv("WAAS_USERNAME", "user@test.com")
+        monkeypatch.setenv("WAAS_PASSWORD", "secret")
+        page = MagicMock()
+        page.goto.side_effect = TimeoutError("auth page timeout")
+        with pytest.raises(TimeoutError):
+            _waas_login(page)
+
+    def test_scrape_direct_calls_login(self, monkeypatch):
+        """_scrape_direct calls _waas_login before navigating."""
+        from waas import _scrape_direct
+
+        login_called = {"count": 0}
+
+        def mock_login(page):
+            login_called["count"] += 1
+            return False
+
+        page = _make_mock_page()
+        mock_browser = MagicMock()
+        mock_browser.new_page.return_value = page
+        mock_pw = MagicMock()
+
+        monkeypatch.setattr("waas._create_browser", lambda: (mock_pw, mock_browser))
+        monkeypatch.setattr("waas._waas_login", mock_login)
+        monkeypatch.setattr("waas.load_waas_seen", lambda: {"jobs": {}})
+        monkeypatch.setattr("waas.save_waas_seen", lambda s: None)
+
+        _scrape_direct(ignore_seen=True)
+        assert login_called["count"] == 1
+
+    def test_scrape_skips_goto_when_login_redirected(self, monkeypatch):
+        """If login redirects to jobs page, don't navigate again."""
+        from waas import _scrape_direct, WAAS_JOBS_URL
+
+        page = _make_mock_page()
+        mock_browser = MagicMock()
+        mock_browser.new_page.return_value = page
+        mock_pw = MagicMock()
+
+        def mock_login(p):
+            p.url = WAAS_JOBS_URL
+            return True
+
+        monkeypatch.setattr("waas._create_browser", lambda: (mock_pw, mock_browser))
+        monkeypatch.setattr("waas._waas_login", mock_login)
+        monkeypatch.setattr("waas.load_waas_seen", lambda: {"jobs": {}})
+        monkeypatch.setattr("waas.save_waas_seen", lambda s: None)
+
+        _scrape_direct(ignore_seen=True)
+        # goto should NOT have been called with the listing URL since login redirected there
+        goto_urls = [c.args[0] for c in page.goto.call_args_list]
+        assert WAAS_JOBS_URL not in goto_urls
+
+    def test_scrape_navigates_when_login_skipped(self, monkeypatch):
+        """Without login, _scrape_direct navigates to jobs page."""
+        from waas import _scrape_direct, WAAS_JOBS_URL
+
+        page = _make_mock_page()
+        mock_browser = MagicMock()
+        mock_browser.new_page.return_value = page
+        mock_pw = MagicMock()
+
+        monkeypatch.setattr("waas._create_browser", lambda: (mock_pw, mock_browser))
+        monkeypatch.setattr("waas._waas_login", lambda p: False)
+        monkeypatch.setattr("waas.load_waas_seen", lambda: {"jobs": {}})
+        monkeypatch.setattr("waas.save_waas_seen", lambda s: None)
+
+        _scrape_direct(ignore_seen=True)
+        first_goto_url = page.goto.call_args_list[0].args[0]
+        assert first_goto_url == WAAS_JOBS_URL
+
+    def test_unauth_limit_warning(self, monkeypatch, caplog):
+        """Warns when hitting unauthenticated job limit."""
+        from waas import _scrape_direct
+
+        cards_html = ""
+        for i in range(30):
+            cards_html += f"""
+            <div class="mb-2 flex w-full rounded-md border border-gray-200 bg-beige-lighter p-2">
+              <a href="/companies/co{i}" target="company"></a>
+              <div class="company-details"><span class="font-bold">Co{i} (W24)</span>
+              <span class="text-gray-600">Desc {i}</span></div>
+              <div class="job-name"><a href="/jobs/{i}" data-jobid="{i}">Engineer {i}</a></div>
+              <p class="job-details"><span>fulltime</span><span>SF, CA</span></p>
+            </div>"""
+        big_html = f"<html><body>{cards_html}</body></html>"
+
+        page = _make_mock_page(listing_html=big_html)
+        mock_browser = MagicMock()
+        mock_browser.new_page.return_value = page
+        mock_pw = MagicMock()
+
+        monkeypatch.setattr("waas._create_browser", lambda: (mock_pw, mock_browser))
+        monkeypatch.setattr("waas._waas_login", lambda p: False)
+        monkeypatch.setattr("waas.load_waas_seen", lambda: {"jobs": {}})
+        monkeypatch.setattr("waas.save_waas_seen", lambda s: None)
+
+        import logging
+        with caplog.at_level(logging.WARNING, logger="waas"):
+            _scrape_direct(ignore_seen=True)
+
+        assert any("WAAS_USERNAME" in msg for msg in caplog.messages)
+
+    def test_no_warning_when_authenticated(self, monkeypatch, caplog):
+        """No warning when authenticated, even with 30+ results."""
+        from waas import _scrape_direct
+
+        cards_html = ""
+        for i in range(30):
+            cards_html += f"""
+            <div class="mb-2 flex w-full rounded-md border border-gray-200 bg-beige-lighter p-2">
+              <a href="/companies/co{i}" target="company"></a>
+              <div class="company-details"><span class="font-bold">Co{i} (W24)</span>
+              <span class="text-gray-600">Desc {i}</span></div>
+              <div class="job-name"><a href="/jobs/{i}" data-jobid="{i}">Engineer {i}</a></div>
+              <p class="job-details"><span>fulltime</span><span>SF, CA</span></p>
+            </div>"""
+        big_html = f"<html><body>{cards_html}</body></html>"
+
+        page = _make_mock_page(listing_html=big_html)
+        mock_browser = MagicMock()
+        mock_browser.new_page.return_value = page
+        mock_pw = MagicMock()
+
+        def mock_login(p):
+            p.url = "https://www.workatastartup.com/jobs?role=eng"
+            return True
+
+        monkeypatch.setattr("waas._create_browser", lambda: (mock_pw, mock_browser))
+        monkeypatch.setattr("waas._waas_login", mock_login)
+        monkeypatch.setattr("waas.load_waas_seen", lambda: {"jobs": {}})
+        monkeypatch.setattr("waas.save_waas_seen", lambda s: None)
+
+        import logging
+        with caplog.at_level(logging.WARNING, logger="waas"):
+            _scrape_direct(ignore_seen=True)
+
+        assert not any("WAAS_USERNAME" in msg for msg in caplog.messages)
