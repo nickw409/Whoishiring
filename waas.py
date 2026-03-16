@@ -446,6 +446,97 @@ def _waas_to_parsed(job: dict) -> dict:
     }
 
 
+# Section markers for weighting keyword matches
+_REQUIREMENTS_RE = re.compile(
+    r"(requirements?|must.have|qualifications?|what you.ll bring|who we.re looking for|what you bring|you have|you.ll need)",
+    re.IGNORECASE,
+)
+_NICE_TO_HAVE_RE = re.compile(
+    r"(nice.to.have|bonus|preferred|ideally|plus|not required)",
+    re.IGNORECASE,
+)
+
+# Weight multipliers for where a keyword appears
+_LOCATION_WEIGHTS = {
+    "title": 3.0,          # keyword in job title = strong signal
+    "requirements": 2.0,   # keyword in requirements section
+    "description": 1.0,    # keyword in general description body
+    "nice_to_have": 0.5,   # keyword in nice-to-have section
+    "tags": 0.3,           # keyword in auto-generated skills tags
+}
+
+
+def _find_section(text: str) -> list[tuple[str, str]]:
+    """Split description into labeled sections for weighting."""
+    sections = []
+    lines = text.split("\n")
+    current_label = "description"
+    current_lines = []
+
+    for line in lines:
+        if _REQUIREMENTS_RE.search(line) and len(line) < 100:
+            if current_lines:
+                sections.append((current_label, "\n".join(current_lines)))
+            current_label = "requirements"
+            current_lines = [line]
+        elif _NICE_TO_HAVE_RE.search(line) and len(line) < 100:
+            if current_lines:
+                sections.append((current_label, "\n".join(current_lines)))
+            current_label = "nice_to_have"
+            current_lines = [line]
+        else:
+            current_lines.append(line)
+
+    if current_lines:
+        sections.append((current_label, "\n".join(current_lines)))
+
+    return sections
+
+
+def _weighted_score(job: dict, matches: dict) -> float:
+    """Score a WAAS job based on where keywords appear.
+
+    Returns a float score. Higher = more relevant. The base category
+    weight is multiplied by a location weight depending on where the
+    keyword was found (title > requirements > description > nice-to-have > tags).
+    """
+    title = job.get("job_title", "")
+    description = job.get("job_description", "")
+    tags = job.get("job_tags") or []
+    tags_text = " ".join(tags)
+
+    sections = _find_section(description)
+
+    total = 0.0
+    for cat, matched_kws in matches.items():
+        cat_weight = hn_jobs.KEYWORD_CATEGORIES[cat]["weight"]
+        for kw in matched_kws:
+            pat = hn_jobs._kw_patterns[kw]
+            best_location_weight = 0.0
+
+            # Check title
+            if pat.search(title):
+                best_location_weight = max(best_location_weight, _LOCATION_WEIGHTS["title"])
+
+            # Check description sections
+            for label, text in sections:
+                if pat.search(text):
+                    w = _LOCATION_WEIGHTS.get(label, _LOCATION_WEIGHTS["description"])
+                    best_location_weight = max(best_location_weight, w)
+
+            # Check tags (only if not found elsewhere with higher weight)
+            if pat.search(tags_text) and best_location_weight < _LOCATION_WEIGHTS["tags"]:
+                best_location_weight = _LOCATION_WEIGHTS["tags"]
+
+            # If keyword wasn't found in any specific location, fall back
+            if best_location_weight == 0:
+                best_location_weight = _LOCATION_WEIGHTS["description"]
+
+            total += cat_weight * best_location_weight
+
+    return round(total, 1)
+
+
 def filter_waas_jobs(raw_jobs: list[dict], hn_company_names: set[str] | None = None) -> tuple[list[dict], list[dict]]:
     """Filter WAAS jobs using HN pipeline logic.
 
@@ -474,7 +565,7 @@ def filter_waas_jobs(raw_jobs: list[dict], hn_company_names: set[str] | None = N
             logger.warning("Skipping WAAS job with missing required fields: %s", job.get("job_url", "?"))
             continue
 
-        # Build text for matching
+        # Build text for matching (all sources combined for keyword detection)
         job_tags = job.get("job_tags") or []
         text_to_match = job["job_title"] + " " + job["job_description"] + " " + " ".join(job_tags)
 
@@ -495,11 +586,11 @@ def filter_waas_jobs(raw_jobs: list[dict], hn_company_names: set[str] | None = N
             logger.warning("match_negative failed for %s", job.get("job_url", "?"), exc_info=True)
             continue
 
-        # Scoring
+        # Weighted scoring (title > requirements > description > nice-to-have > tags)
         try:
-            score = hn_jobs.score_matches(matches)
+            score = _weighted_score(job, matches)
         except Exception:
-            logger.warning("score_matches failed for %s", job.get("job_url", "?"), exc_info=True)
+            logger.warning("_weighted_score failed for %s", job.get("job_url", "?"), exc_info=True)
             continue
 
         # Location filtering

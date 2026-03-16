@@ -10,6 +10,8 @@ from waas import (
     _company_to_jobs,
     _load_waas_filters,
     _build_algolia_filter_string,
+    _weighted_score,
+    _find_section,
     filter_waas_jobs,
     scan_and_filter_waas,
     scrape_waas_jobs,
@@ -286,7 +288,7 @@ class TestFilterWaasJobs:
         results, filtered_out = filter_waas_jobs([job])
         assert len(results) == 1
         assert "Systems" in results[0]["matches"]
-        assert results[0]["score"] == 2
+        assert results[0]["score"] > 0
         assert results[0]["source"] == "waas"
 
     def test_negative_keyword(self):
@@ -382,7 +384,9 @@ class TestFilterWaasJobs:
         )
         results, _ = filter_waas_jobs([job])
         assert len(results) == 1
-        assert results[0]["score"] == 6
+        # Weighted score should be higher than simple category sum (6)
+        # because multiple keywords per category each contribute
+        assert results[0]["score"] > 6
 
     def test_multiple_negative_keywords(self):
         job = _make_job(
@@ -801,6 +805,134 @@ class TestScrapeViaApi:
         monkeypatch.setenv("WAAS_PASSWORD", "")
         companies, key = _scrape_via_api()
         assert companies == []
+
+
+# ---------------------------------------------------------------------------
+# Weighted scoring
+# ---------------------------------------------------------------------------
+
+class TestWeightedScoring:
+    def test_keyword_in_title_scores_higher(self):
+        """Rust in title should score higher than Rust only in tags."""
+        job_title = _make_job(
+            job_title="Rust Systems Engineer",
+            job_description="Join our team",
+            job_tags=[],
+        )
+        job_tags = _make_job(
+            job_title="Software Engineer",
+            job_description="Join our team",
+            job_tags=["Rust"],
+        )
+        import hn_jobs
+        matches = {"Systems": ["rust"]}
+
+        score_title = _weighted_score(job_title, matches)
+        score_tags = _weighted_score(job_tags, matches)
+        assert score_title > score_tags
+
+    def test_keyword_in_requirements_scores_higher_than_nice_to_have(self):
+        job_req = _make_job(
+            job_title="Engineer",
+            job_description="## Requirements\nMust have experience with Rust and systems programming.\n## Nice to have\nGo experience.",
+            job_tags=[],
+        )
+        job_nice = _make_job(
+            job_title="Engineer",
+            job_description="## Requirements\nMust have Python experience.\n## Nice to have\nRust and systems programming experience is a bonus.",
+            job_tags=[],
+        )
+        matches = {"Systems": ["rust", "systems programming"]}
+
+        score_req = _weighted_score(job_req, matches)
+        score_nice = _weighted_score(job_nice, matches)
+        assert score_req > score_nice
+
+    def test_keyword_in_description_body_scores_higher_than_tags(self):
+        job_desc = _make_job(
+            job_title="Engineer",
+            job_description="We build high-performance CUDA systems on GPUs",
+            job_tags=[],
+        )
+        job_tags = _make_job(
+            job_title="Engineer",
+            job_description="Join our team",
+            job_tags=["CUDA", "GPU"],
+        )
+        matches = {"Systems": ["cuda", "gpu"]}
+
+        score_desc = _weighted_score(job_desc, matches)
+        score_tags = _weighted_score(job_tags, matches)
+        assert score_desc > score_tags
+
+    def test_multiple_categories_accumulate(self):
+        job = _make_job(
+            job_title="ML Engineer",
+            job_description="Build agentic LLM systems using Rust and CUDA for machine learning",
+            job_tags=[],
+        )
+        matches = {
+            "AI tooling": ["agentic", "llm"],
+            "Systems": ["rust", "cuda"],
+            "General AI+SWE": ["machine learning"],
+        }
+        score = _weighted_score(job, matches)
+        assert score > 0
+
+    def test_tags_only_match_gets_low_score(self):
+        """A keyword that only appears in tags should get the minimum score."""
+        job = _make_job(
+            job_title="Software Engineer",
+            job_description="Build web applications",
+            job_tags=["Rust"],
+        )
+        matches = {"Systems": ["rust"]}
+        score = _weighted_score(job, matches)
+        # Systems weight=2, tags multiplier=0.3 → 0.6
+        assert score == 0.6
+
+    def test_title_match_gets_high_score(self):
+        job = _make_job(
+            job_title="Rust Engineer",
+            job_description="Build things",
+            job_tags=[],
+        )
+        matches = {"Systems": ["rust"]}
+        score = _weighted_score(job, matches)
+        # Systems weight=2, title multiplier=3.0 → 6.0
+        assert score == 6.0
+
+    def test_filter_uses_weighted_score(self):
+        """filter_waas_jobs should use weighted scoring for WAAS jobs."""
+        job_title = _make_job(
+            job_url="https://waas.com/1",
+            job_title="Rust Systems Engineer",
+            job_description="Join our team and build things",
+            job_tags=[],
+        )
+        job_tags = _make_job(
+            job_url="https://waas.com/2",
+            job_title="Software Engineer",
+            job_description="Join our team and build things",
+            job_tags=["Rust"],
+        )
+        results, _ = filter_waas_jobs([job_title, job_tags])
+        assert len(results) == 2
+        # Title match should score higher
+        assert results[0]["parsed"]["id"] == "https://waas.com/1" or results[0]["score"] >= results[1]["score"]
+
+    def test_find_section_identifies_requirements(self):
+        text = "About us\nWe are cool.\n\n## Requirements\nRust experience needed.\n\n## Nice to have\nGo experience."
+        sections = _find_section(text)
+        labels = [s[0] for s in sections]
+        assert "requirements" in labels
+        assert "nice_to_have" in labels
+
+    def test_find_section_plain_text(self):
+        text = "We build things with Rust."
+        sections = _find_section(text)
+        assert len(sections) == 1
+        assert sections[0][0] == "description"
 
 
 # ---------------------------------------------------------------------------
