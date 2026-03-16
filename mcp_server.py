@@ -329,6 +329,106 @@ def get_latest_results() -> str:
     return json_files[0].read_text()
 
 
+@mcp.tool()
+def get_config() -> str:
+    """Get the current config.yaml contents.
+
+    Returns the full config including resume path, preferences, and
+    WAAS filters. Use this to see current settings before updating.
+    """
+    config_file = Path(__file__).parent / "config.yaml"
+    if not config_file.exists():
+        return json.dumps({"error": "No config.yaml found. Use update_config to create one."})
+    return config_file.read_text()
+
+
+@mcp.tool()
+def update_config(
+    resume: str | None = None,
+    remote_preference: str | None = None,
+    preference_notes: str | None = None,
+    waas_role: str | None = None,
+    waas_eng_type: str | None = None,
+    waas_remote: str | None = None,
+    waas_job_type: str | None = None,
+    waas_min_experience: str | None = None,
+    waas_us_visa_required: str | None = None,
+    waas_has_salary: str | None = None,
+    waas_company_waas_stage: str | None = None,
+) -> str:
+    """Update config.yaml settings. Only provided fields are changed; others are preserved.
+
+    Use this to adjust preferences, resume path, or WAAS search filters.
+    Pass null/None to remove a WAAS filter (revert to default).
+
+    Args:
+        resume: Path to PDF resume file for ranking.
+        remote_preference: Remote work preference (e.g. "preferred", "required", "flexible").
+        preference_notes: Free-form notes about what you're looking for, sent to the ranker.
+        waas_role: WAAS role filter. Values: eng, sales, operations, marketing, product.
+        waas_eng_type: WAAS engineering type. Values: fs, be, ml, fe, eng_mgmt, devops, embedded.
+        waas_remote: WAAS remote filter. Values: yes, only, no.
+        waas_job_type: WAAS job type. Values: fulltime, intern, contract, cofounder.
+        waas_min_experience: WAAS min experience. Values: 0, 1, 3, 6, 11.
+        waas_us_visa_required: WAAS visa filter. Values: yes, none, possible.
+        waas_has_salary: WAAS salary listed filter. Values: true, false.
+        waas_company_waas_stage: WAAS company stage. Values: seed, series_a, growth, scale.
+    """
+    import yaml
+
+    config_file = Path(__file__).parent / "config.yaml"
+    config = {}
+    if config_file.exists():
+        try:
+            with open(config_file) as f:
+                config = yaml.safe_load(f) or {}
+        except Exception:
+            config = {}
+
+    if resume is not None:
+        config["resume"] = resume
+
+    if remote_preference is not None or preference_notes is not None:
+        prefs = config.get("preferences", {}) or {}
+        if remote_preference is not None:
+            prefs["remote"] = remote_preference
+        if preference_notes is not None:
+            prefs["notes"] = preference_notes
+        config["preferences"] = prefs
+
+    # WAAS filters
+    waas_args = {
+        "role": waas_role,
+        "eng_type": waas_eng_type,
+        "remote": waas_remote,
+        "job_type": waas_job_type,
+        "min_experience": waas_min_experience,
+        "us_visa_required": waas_us_visa_required,
+        "has_salary": waas_has_salary,
+        "company_waas_stage": waas_company_waas_stage,
+    }
+
+    # Only touch the waas section if any waas_ arg was explicitly passed
+    waas_updates = {k: v for k, v in waas_args.items() if v is not None}
+    if waas_updates:
+        waas_config = config.get("waas", {}) or {}
+        for key, value in waas_updates.items():
+            if value == "none" and key != "us_visa_required":
+                # "none" means remove the filter (except us_visa_required where it's a valid value)
+                waas_config.pop(key, None)
+            else:
+                waas_config[key] = value
+        config["waas"] = waas_config
+
+    with open(config_file, "w") as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+    return json.dumps({
+        "status": "updated",
+        "config": config,
+    }, indent=2, default=str)
+
+
 @mcp.prompt()
 def find_jobs() -> str:
     """Find and rank jobs from both HN and YC startups against my resume."""
