@@ -159,15 +159,22 @@ def scan_jobs(months: int = 1, ignore_seen: bool = False) -> str:
     return json.dumps(output, indent=2)
 
 
+WAAS_MAX_RESULTS = 300
+
+
 @mcp.tool()
 def scan_waas(ignore_seen: bool = False) -> str:
     """Scan Work at a Startup (workatastartup.com) for matching engineering jobs.
 
-    Authenticates with YC (requires WAAS_USERNAME/WAAS_PASSWORD env vars),
-    then fetches all job listings via the WAAS API. Filters by the same
-    keyword categories as HN scanning. Pre-filters at the API level using
-    Algolia (defaults: role=eng, job_type=fulltime; configurable via
-    config.yaml under the "waas" key).
+    Returns up to the top 300 results sorted by keyword score, with full
+    job descriptions included. Results are pre-filtered by keyword
+    categories (AI tooling, Systems, General AI+SWE), negative keywords
+    (senior/management), and location (non-US non-remote filtered out).
+
+    Authenticates with YC (requires WAAS_USERNAME/WAAS_PASSWORD env vars).
+    Pre-filters at the API level using Algolia (defaults: role=eng,
+    job_type=fulltime; configurable via config.yaml under "waas" key or
+    via update_config tool).
 
     Available config.yaml filters under "waas":
       role: eng|sales|operations|marketing|product
@@ -181,11 +188,7 @@ def scan_waas(ignore_seen: bool = False) -> str:
 
     Each result includes: company (with YC batch and team size), job title,
     location, remote status, salary range, keyword score, matched
-    categories/keywords, full job description, skills, and a direct
-    WAAS job link.
-
-    Without credentials, returns 0 results. Set WAAS_USERNAME and
-    WAAS_PASSWORD in the .env file.
+    categories/keywords, full job description, and a direct WAAS job link.
 
     Args:
         ignore_seen: If true, return all matching jobs even if previously seen.
@@ -201,32 +204,38 @@ def scan_waas(ignore_seen: bool = False) -> str:
             "error": str(e),
         }, indent=2)
 
+    formatted = _format_waas_results(results)
+    total_before_cap = len(formatted)
+    formatted = formatted[:WAAS_MAX_RESULTS]
+
     return json.dumps({
         "source": "waas",
-        "total_results": len(results),
+        "total_results": len(formatted),
+        "total_matched": total_before_cap,
         "total_filtered": len(filtered_out),
-        "results": _format_waas_results(results),
+        "capped_at": WAAS_MAX_RESULTS if total_before_cap > WAAS_MAX_RESULTS else None,
+        "results": formatted,
     }, indent=2)
+
+
+ALL_MAX_RESULTS = 300
 
 
 @mcp.tool()
 def scan_all(ignore_seen: bool = False, months: int = 1) -> str:
     """Scan both HN Who's Hiring and Work at a Startup, then combine results.
 
-    Runs both scans in parallel for speed. HN results come from monthly
-    "Who is Hiring?" threads; WAAS results come from YC's job board API
-    (thousands of listings with full descriptions, salary ranges, and skills).
+    Returns up to the top 300 results sorted by keyword score, with full
+    descriptions included. Runs both scans in parallel for speed.
 
     Cross-source deduplication: if a company appears on both HN and WAAS,
-    only the HN listing is kept. Results from both sources are merged and
-    sorted by keyword score descending.
-
-    Response includes per-source counts (hn_results, waas_results) and
-    any errors that occurred. If one source fails, the other still returns.
-
-    Each result has a "source" field ("hn" or "waas") so you can tell
-    where it came from. WAAS results include extra fields: job_title,
+    only the HN listing is kept. Each result has a "source" field
+    ("hn" or "waas"). WAAS results include extra fields: job_title,
     salary_range, company_yc_batch, and company_size.
+
+    Response includes per-source counts (hn_results, waas_results),
+    total_matched (before capping), and any errors from either source.
+    If one source fails, the other still returns.
 
     Args:
         ignore_seen: If true, return all jobs even if previously seen.
@@ -234,7 +243,6 @@ def scan_all(ignore_seen: bool = False, months: int = 1) -> str:
     """
     errors = []
 
-    # Pass 1: scrape both sources in parallel
     with ThreadPoolExecutor(max_workers=2) as pool:
         hn_future = pool.submit(_scan_hn, months, ignore_seen)
         waas_future = pool.submit(waas.scrape_waas_jobs, ignore_seen=ignore_seen)
@@ -251,7 +259,6 @@ def scan_all(ignore_seen: bool = False, months: int = 1) -> str:
             waas_raw = []
             errors.append(f"WAAS scrape failed: {e}")
 
-    # Pass 2: dedup WAAS against HN companies, then filter
     hn_company_names = set()
     for item in hn_results:
         company = item["parsed"].get("company")
@@ -264,18 +271,22 @@ def scan_all(ignore_seen: bool = False, months: int = 1) -> str:
         waas_results, waas_filtered = [], []
         errors.append(f"WAAS filter failed: {e}")
 
-    # Combine and sort by score descending
     combined = _format_hn_results(hn_results) + _format_waas_results(waas_results)
     combined.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+    total_before_cap = len(combined)
+    combined = combined[:ALL_MAX_RESULTS]
 
     result = {
         "sources": ["hn", "waas"],
         "threads": thread_titles,
         "total_results": len(combined),
+        "total_matched": total_before_cap,
         "total_filtered": len(hn_filtered) + len(waas_filtered),
         "hn_results": len(hn_results),
         "waas_results": len(waas_results),
         "waas_raw_scraped": len(waas_raw),
+        "capped_at": ALL_MAX_RESULTS if total_before_cap > ALL_MAX_RESULTS else None,
         "results": combined,
     }
     if errors:
@@ -436,12 +447,11 @@ def find_jobs() -> str:
         "Use get_resume and get_preferences to understand my background, "
         "then scan_all with ignore_seen=true to find matching positions from "
         "both HN Who's Hiring and Work at a Startup (YC's job board). "
+        "Returns up to the top 300 results by keyword score with full descriptions. "
         "Rank every job from best to worst fit for me. "
         "For each of your top 15, include: rank, company name, job title, "
         "location/remote, salary range (if available from WAAS), YC batch "
-        "(if available), and a 1-2 sentence reason why it's a good fit. "
-        "Group WAAS results separately if they have salary/title info that "
-        "HN results lack."
+        "(if available), and a 1-2 sentence reason why it's a good fit."
     )
 
 
@@ -483,12 +493,11 @@ def waas_only() -> str:
     return (
         "Use get_resume and get_preferences to understand my background, "
         "then scan_waas with ignore_seen=true to find engineering jobs from "
-        "YC startups on Work at a Startup. "
+        "YC startups on Work at a Startup. Returns up to 300 top results "
+        "by keyword score with full descriptions. "
         "Rank the results by fit. For each of your top 15, include: "
         "company name, YC batch, job title, salary range, location/remote, "
-        "team size, and a reason why it fits my background. "
-        "WAAS results have rich data — use salary ranges, skills, and "
-        "company descriptions to make better ranking decisions."
+        "team size, and a reason why it fits my background."
     )
 
 
