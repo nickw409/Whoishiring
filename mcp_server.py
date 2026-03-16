@@ -165,14 +165,96 @@ def _build_keyword_snippet(text: str, keywords: list[str], limit: int = DESC_LIM
     return " ... ".join(parts)
 
 
+_SENIORITY_TITLE_RE = re.compile(
+    r"\b(staff|principal|senior|lead|sr\.?|founding)\b", re.IGNORECASE
+)
+_EXPERIENCE_RE = re.compile(r"(\d+)\+?\s*(?:years?|yrs?)\b", re.IGNORECASE)
+
+
+def _estimate_seniority(title: str, description: str, min_experience: str = "") -> str:
+    """Estimate seniority level from title, description, and experience requirement."""
+    title_lower = title.lower()
+
+    if any(kw in title_lower for kw in ["staff", "principal"]):
+        return "staff+"
+    if any(kw in title_lower for kw in ["senior", "sr.", "sr "]):
+        return "senior"
+    if any(kw in title_lower for kw in ["lead"]):
+        return "senior"
+    if any(kw in title_lower for kw in ["founding"]):
+        return "any"
+    if any(kw in title_lower for kw in ["intern"]):
+        return "intern"
+    if any(kw in title_lower for kw in ["junior", "jr.", "jr "]):
+        return "junior"
+
+    # Check experience years in description
+    exp_matches = _EXPERIENCE_RE.findall(description[:1000])
+    if exp_matches:
+        max_years = max(int(y) for y in exp_matches)
+        if max_years >= 8:
+            return "senior"
+        if max_years >= 4:
+            return "mid-senior"
+        if max_years >= 2:
+            return "mid"
+        return "junior-mid"
+
+    # Fall back to min_experience field from API
+    if min_experience:
+        try:
+            years = int(min_experience.replace("+", "").split()[0])
+            if years >= 6:
+                return "senior"
+            if years >= 3:
+                return "mid"
+            return "junior-mid"
+        except (ValueError, IndexError):
+            pass
+
+    return "unknown"
+
+
+def _dedup_by_company(results: list[dict]) -> list[dict]:
+    """Keep only the highest-scoring role per company. Adds other_roles_count."""
+    company_groups: dict[str, list[dict]] = {}
+    for r in results:
+        key = r["company"].lower().strip()
+        company_groups.setdefault(key, []).append(r)
+
+    deduped = []
+    for group in company_groups.values():
+        group.sort(key=lambda x: x.get("score", 0), reverse=True)
+        best = group[0]
+        if len(group) > 1:
+            best["other_roles_count"] = len(group) - 1
+            best["other_roles"] = [
+                {"job_title": r.get("job_title", ""), "job_url": r.get("job_url", "")}
+                for r in group[1:]
+            ]
+        deduped.append(best)
+
+    deduped.sort(key=lambda x: x.get("score", 0), reverse=True)
+    return deduped
+
+
+# Full results cache for get_job_details
+_full_results_cache: list[dict] = []
+
+
 def _format_waas_results(results: list[dict]) -> list[dict]:
     """Format WAAS results for JSON output with keyword-focused snippets."""
+    global _full_results_cache
     output = []
+    full_cache = []
     for item in results:
         p = item["parsed"]
         keywords = [kw for kws in item["matches"].values() for kw in kws]
         snippet = _build_keyword_snippet(p["full_text"], keywords)
-        output.append({
+        job_url = p["job_board_urls"][0]["url"] if p["job_board_urls"] else ""
+        job_title = p["job_board_urls"][0]["title"] if p["job_board_urls"] else ""
+
+        formatted = {
             "company": p["company"],
             "location": p["location"],
             "remote": p["remote"],
@@ -180,13 +262,20 @@ def _format_waas_results(results: list[dict]) -> list[dict]:
             "matched_categories": list(item["matches"].keys()),
             "matched_keywords": keywords,
             "full_text": snippet,
-            "job_url": p["job_board_urls"][0]["url"] if p["job_board_urls"] else "",
-            "job_title": p["job_board_urls"][0]["title"] if p["job_board_urls"] else "",
+            "job_url": job_url,
+            "job_title": job_title,
             "salary_range": p.get("salary_range", ""),
             "company_yc_batch": p.get("company_yc_batch", ""),
             "company_size": p.get("company_size", ""),
+            "seniority": _estimate_seniority(job_title, p["full_text"]),
             "source": "waas",
-        })
+        }
+        output.append(formatted)
+
+        # Cache with full text for get_job_details
+        full_cache.append({**formatted, "full_text": p["full_text"]})
+
+    _full_results_cache = full_cache
     return output
 
 
@@ -227,14 +316,20 @@ WAAS_MAX_RESULTS = 1000
 
 
 @mcp.tool()
-def scan_waas(ignore_seen: bool = False) -> str:
+def scan_waas(ignore_seen: bool = False, group_by_company: bool = True) -> str:
     """Scan Work at a Startup (workatastartup.com) for matching engineering jobs.
 
-    Returns up to the top 1000 results sorted by keyword score.
-    Descriptions are truncated to 500 chars — enough for ranking.
-    Results are pre-filtered by keyword categories (AI tooling, Systems,
-    General AI+SWE), negative keywords (senior/management), and location
-    (non-US non-remote filtered out).
+    Returns up to 1000 results sorted by keyword score, with keyword-context
+    snippets (500 chars around matched terms). Use get_job_details to fetch
+    the full description for specific jobs.
+
+    By default, results are grouped by company — only the highest-scoring
+    role per company is returned. Each result includes other_roles_count
+    and other_roles (title + URL) for that company. Set group_by_company=false
+    to see all roles.
+
+    Each result includes a seniority estimate (intern, junior, mid, senior,
+    staff+, or unknown) derived from the job title and experience requirements.
 
     Authenticates with YC (requires WAAS_USERNAME/WAAS_PASSWORD env vars).
     Pre-filters at the API level using Algolia (defaults: role=eng,
@@ -252,12 +347,9 @@ def scan_waas(ignore_seen: bool = False) -> str:
       company_waas_stage: seed|series_a|growth|scale|any (default: any)
     Set a filter to "any" to disable it. Omit it to use the default.
 
-    Each result includes: company (with YC batch and team size), job title,
-    location, remote status, salary range, keyword score, matched
-    categories/keywords, full job description, and a direct WAAS job link.
-
     Args:
         ignore_seen: If true, return all matching jobs even if previously seen.
+        group_by_company: If true (default), show only the best role per company.
     """
     try:
         results, filtered_out = waas.scan_and_filter_waas(ignore_seen=ignore_seen)
@@ -271,41 +363,61 @@ def scan_waas(ignore_seen: bool = False) -> str:
         }, indent=2)
 
     formatted = _format_waas_results(results)
-    total_before_cap = len(formatted)
+    total_all_roles = len(formatted)
+
+    if group_by_company:
+        formatted = _dedup_by_company(formatted)
+
     formatted = formatted[:WAAS_MAX_RESULTS]
 
     return json.dumps({
         "source": "waas",
         "total_results": len(formatted),
-        "total_matched": total_before_cap,
+        "total_all_roles": total_all_roles,
         "total_filtered": len(filtered_out),
-        "capped_at": WAAS_MAX_RESULTS if total_before_cap > WAAS_MAX_RESULTS else None,
+        "grouped_by_company": group_by_company,
         "results": formatted,
     }, indent=2)
+
+
+@mcp.tool()
+def get_job_details(job_url: str) -> str:
+    """Get the full untruncated description for a specific WAAS job.
+
+    Returns the complete job description and all metadata without any
+    truncation. Use this after scan_waas or scan_all to read the full
+    details for jobs you're considering.
+
+    Args:
+        job_url: The WAAS job URL (e.g. https://www.workatastartup.com/jobs/12345).
+    """
+    for r in _full_results_cache:
+        if r.get("job_url") == job_url:
+            return json.dumps(r, indent=2)
+    return json.dumps({"error": f"Job not found in cache: {job_url}. Run scan_waas or scan_all first."})
 
 
 ALL_MAX_RESULTS = 1000
 
 
 @mcp.tool()
-def scan_all(ignore_seen: bool = False, months: int = 1) -> str:
+def scan_all(ignore_seen: bool = False, months: int = 1, group_by_company: bool = True) -> str:
     """Scan both HN Who's Hiring and Work at a Startup, then combine results.
 
-    Returns up to the top 1000 results sorted by keyword score, with full
-    descriptions included. Runs both scans in parallel for speed.
+    Returns up to 1000 results sorted by keyword score. Runs both scans
+    in parallel. By default, groups by company (best role per company).
 
     Cross-source deduplication: if a company appears on both HN and WAAS,
     only the HN listing is kept. Each result has a "source" field
-    ("hn" or "waas"). WAAS results include extra fields: job_title,
-    salary_range, company_yc_batch, and company_size.
+    ("hn" or "waas"). WAAS results include: job_title, salary_range,
+    company_yc_batch, company_size, and seniority estimate.
 
-    Response includes per-source counts (hn_results, waas_results),
-    total_matched (before capping), and any errors from either source.
-    If one source fails, the other still returns.
+    Use get_job_details to fetch full descriptions for specific WAAS jobs.
 
     Args:
         ignore_seen: If true, return all jobs even if previously seen.
         months: Number of HN monthly threads to scan (1-3).
+        group_by_company: If true (default), show only the best role per company.
     """
     errors = []
 
@@ -340,19 +452,23 @@ def scan_all(ignore_seen: bool = False, months: int = 1) -> str:
     combined = _format_hn_results(hn_results) + _format_waas_results(waas_results)
     combined.sort(key=lambda x: x.get("score", 0), reverse=True)
 
-    total_before_cap = len(combined)
+    total_all_roles = len(combined)
+
+    if group_by_company:
+        combined = _dedup_by_company(combined)
+
     combined = combined[:ALL_MAX_RESULTS]
 
     result = {
         "sources": ["hn", "waas"],
         "threads": thread_titles,
         "total_results": len(combined),
-        "total_matched": total_before_cap,
+        "total_all_roles": total_all_roles,
         "total_filtered": len(hn_filtered) + len(waas_filtered),
         "hn_results": len(hn_results),
         "waas_results": len(waas_results),
         "waas_raw_scraped": len(waas_raw),
-        "capped_at": ALL_MAX_RESULTS if total_before_cap > ALL_MAX_RESULTS else None,
+        "grouped_by_company": group_by_company,
         "results": combined,
     }
     if errors:
@@ -514,11 +630,14 @@ def find_jobs() -> str:
         "Use get_resume and get_preferences to understand my background, "
         "then scan_all with ignore_seen=true to find matching positions from "
         "both HN Who's Hiring and Work at a Startup (YC's job board). "
-        "Returns up to the top 1000 results by keyword score with full descriptions. "
-        "Rank every job from best to worst fit for me. "
-        "For each of your top 15, include: rank, company name, job title, "
-        "location/remote, salary range (if available from WAAS), YC batch "
-        "(if available), and a 1-2 sentence reason why it's a good fit."
+        "Results are grouped by company (best role per company). "
+        "Each result includes a seniority estimate — use it to filter out "
+        "roles that don't match my experience level. "
+        "For promising matches, use get_job_details with the job_url to "
+        "read the full description before finalizing your ranking. "
+        "Rank your top 15 by fit. For each, include: company name, "
+        "job title, seniority, location/remote, salary range, YC batch, "
+        "job URL, and a reason connecting my resume to the role."
     )
 
 
@@ -560,11 +679,11 @@ def waas_only() -> str:
     return (
         "Use get_resume and get_preferences to understand my background, "
         "then scan_waas with ignore_seen=true to find engineering jobs from "
-        "YC startups on Work at a Startup. Returns up to 300 top results "
-        "by keyword score with full descriptions. "
-        "Rank the results by fit. For each of your top 15, include: "
-        "company name, YC batch, job title, salary range, location/remote, "
-        "team size, and a reason why it fits my background."
+        "YC startups. Results are grouped by company with seniority estimates. "
+        "Use get_job_details for promising matches to read full descriptions. "
+        "Rank your top 15 by fit. For each, include: company name, YC batch, "
+        "job title, seniority, salary range, location/remote, team size, "
+        "job URL, and a reason connecting my resume to the role."
     )
 
 

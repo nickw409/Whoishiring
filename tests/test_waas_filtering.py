@@ -911,3 +911,154 @@ class TestAlgoliaFilters:
         filters["min_experience"] = "3"
         s = _build_algolia_filter_string(filters)
         assert s == "(min_experience:3)"
+
+
+# ---------------------------------------------------------------------------
+# Seniority estimation
+# ---------------------------------------------------------------------------
+
+class TestSeniorityEstimation:
+    def test_staff_in_title(self):
+        from mcp_server import _estimate_seniority
+        assert _estimate_seniority("Staff Engineer", "") == "staff+"
+
+    def test_principal_in_title(self):
+        from mcp_server import _estimate_seniority
+        assert _estimate_seniority("Principal Software Engineer", "") == "staff+"
+
+    def test_senior_in_title(self):
+        from mcp_server import _estimate_seniority
+        assert _estimate_seniority("Senior Backend Engineer", "") == "senior"
+
+    def test_sr_in_title(self):
+        from mcp_server import _estimate_seniority
+        assert _estimate_seniority("Sr. Software Engineer", "") == "senior"
+
+    def test_lead_in_title(self):
+        from mcp_server import _estimate_seniority
+        assert _estimate_seniority("Engineering Lead", "") == "senior"
+
+    def test_founding_in_title(self):
+        from mcp_server import _estimate_seniority
+        assert _estimate_seniority("Founding Engineer", "") == "any"
+
+    def test_intern_in_title(self):
+        from mcp_server import _estimate_seniority
+        assert _estimate_seniority("Engineering Intern", "") == "intern"
+
+    def test_junior_in_title(self):
+        from mcp_server import _estimate_seniority
+        assert _estimate_seniority("Junior Developer", "") == "junior"
+
+    def test_experience_from_description(self):
+        from mcp_server import _estimate_seniority
+        assert _estimate_seniority("Software Engineer", "Requires 5+ years of experience") == "mid-senior"
+
+    def test_high_experience_from_description(self):
+        from mcp_server import _estimate_seniority
+        assert _estimate_seniority("Software Engineer", "8+ years required") == "senior"
+
+    def test_low_experience_from_description(self):
+        from mcp_server import _estimate_seniority
+        assert _estimate_seniority("Software Engineer", "2+ years experience") == "mid"
+
+    def test_unknown_seniority(self):
+        from mcp_server import _estimate_seniority
+        assert _estimate_seniority("Software Engineer", "We build things") == "unknown"
+
+    def test_title_takes_priority_over_description(self):
+        from mcp_server import _estimate_seniority
+        # Title says senior even though desc says 2 years
+        assert _estimate_seniority("Senior Engineer", "2+ years experience") == "senior"
+
+
+# ---------------------------------------------------------------------------
+# Company deduplication
+# ---------------------------------------------------------------------------
+
+class TestCompanyDedup:
+    def test_groups_same_company(self):
+        from mcp_server import _dedup_by_company
+        results = [
+            {"company": "Acme", "score": 3, "job_title": "Backend", "job_url": "/1"},
+            {"company": "Acme", "score": 5, "job_title": "ML Eng", "job_url": "/2"},
+            {"company": "Acme", "score": 1, "job_title": "Frontend", "job_url": "/3"},
+        ]
+        deduped = _dedup_by_company(results)
+        assert len(deduped) == 1
+        assert deduped[0]["score"] == 5  # highest score kept
+        assert deduped[0]["job_title"] == "ML Eng"
+        assert deduped[0]["other_roles_count"] == 2
+        assert len(deduped[0]["other_roles"]) == 2
+
+    def test_case_insensitive(self):
+        from mcp_server import _dedup_by_company
+        results = [
+            {"company": "Acme Corp", "score": 3, "job_title": "A", "job_url": "/1"},
+            {"company": "acme corp", "score": 5, "job_title": "B", "job_url": "/2"},
+        ]
+        deduped = _dedup_by_company(results)
+        assert len(deduped) == 1
+
+    def test_different_companies_kept(self):
+        from mcp_server import _dedup_by_company
+        results = [
+            {"company": "Acme", "score": 3, "job_title": "A", "job_url": "/1"},
+            {"company": "Beta", "score": 5, "job_title": "B", "job_url": "/2"},
+        ]
+        deduped = _dedup_by_company(results)
+        assert len(deduped) == 2
+
+    def test_single_role_no_other_roles(self):
+        from mcp_server import _dedup_by_company
+        results = [
+            {"company": "Acme", "score": 3, "job_title": "A", "job_url": "/1"},
+        ]
+        deduped = _dedup_by_company(results)
+        assert len(deduped) == 1
+        assert "other_roles_count" not in deduped[0]
+        assert "other_roles" not in deduped[0]
+
+    def test_sorted_by_score_descending(self):
+        from mcp_server import _dedup_by_company
+        results = [
+            {"company": "Acme", "score": 1, "job_title": "A", "job_url": "/1"},
+            {"company": "Beta", "score": 5, "job_title": "B", "job_url": "/2"},
+            {"company": "Gamma", "score": 3, "job_title": "C", "job_url": "/3"},
+        ]
+        deduped = _dedup_by_company(results)
+        scores = [r["score"] for r in deduped]
+        assert scores == [5, 3, 1]
+
+    def test_other_roles_have_title_and_url(self):
+        from mcp_server import _dedup_by_company
+        results = [
+            {"company": "Acme", "score": 5, "job_title": "ML Eng", "job_url": "/1"},
+            {"company": "Acme", "score": 3, "job_title": "Backend", "job_url": "/2"},
+        ]
+        deduped = _dedup_by_company(results)
+        other = deduped[0]["other_roles"]
+        assert other[0]["job_title"] == "Backend"
+        assert other[0]["job_url"] == "/2"
+
+
+# ---------------------------------------------------------------------------
+# get_job_details
+# ---------------------------------------------------------------------------
+
+class TestGetJobDetails:
+    def test_found_in_cache(self, monkeypatch):
+        from mcp_server import get_job_details
+        import mcp_server
+        mcp_server._full_results_cache = [
+            {"job_url": "https://waas.com/jobs/123", "full_text": "Full description here", "company": "Test"},
+        ]
+        result = json.loads(get_job_details("https://waas.com/jobs/123"))
+        assert result["full_text"] == "Full description here"
+
+    def test_not_found(self, monkeypatch):
+        from mcp_server import get_job_details
+        import mcp_server
+        mcp_server._full_results_cache = []
+        result = json.loads(get_job_details("https://waas.com/jobs/999"))
+        assert "error" in result
