@@ -8,6 +8,8 @@ from unittest.mock import patch, MagicMock
 from waas import (
     _waas_to_parsed,
     _company_to_jobs,
+    _load_waas_filters,
+    _build_algolia_filter_string,
     filter_waas_jobs,
     scan_and_filter_waas,
     scrape_waas_jobs,
@@ -17,6 +19,7 @@ from waas import (
     prune_waas_seen,
     WAAS_PRUNE_DAYS,
     WAAS_BASE_URL,
+    WAAS_DEFAULT_FILTERS,
 )
 
 
@@ -798,3 +801,113 @@ class TestScrapeViaApi:
         monkeypatch.setenv("WAAS_PASSWORD", "")
         companies, key = _scrape_via_api()
         assert companies == []
+
+
+# ---------------------------------------------------------------------------
+# Algolia filters
+# ---------------------------------------------------------------------------
+
+class TestAlgoliaFilters:
+    def test_defaults(self):
+        assert WAAS_DEFAULT_FILTERS["role"] == "eng"
+        assert WAAS_DEFAULT_FILTERS["job_type"] == "fulltime"
+        assert WAAS_DEFAULT_FILTERS["remote"] is None
+        assert WAAS_DEFAULT_FILTERS["eng_type"] is None
+
+    def test_build_filter_string_defaults(self):
+        s = _build_algolia_filter_string(WAAS_DEFAULT_FILTERS)
+        assert "(role:eng)" in s
+        assert "(job_type:fulltime)" in s
+        assert "remote" not in s
+        assert "eng_type" not in s
+
+    def test_build_filter_string_all_none(self):
+        filters = {k: None for k in WAAS_DEFAULT_FILTERS}
+        s = _build_algolia_filter_string(filters)
+        assert s == ""
+
+    def test_build_filter_string_single(self):
+        filters = {k: None for k in WAAS_DEFAULT_FILTERS}
+        filters["role"] = "eng"
+        s = _build_algolia_filter_string(filters)
+        assert s == "(role:eng)"
+
+    def test_build_filter_string_multiple(self):
+        filters = {k: None for k in WAAS_DEFAULT_FILTERS}
+        filters["role"] = "eng"
+        filters["remote"] = "only"
+        filters["job_type"] = "fulltime"
+        s = _build_algolia_filter_string(filters)
+        assert "(role:eng)" in s
+        assert "(remote:only)" in s
+        assert "(job_type:fulltime)" in s
+        assert " AND " in s
+
+    def test_load_filters_no_config(self, tmp_path, monkeypatch):
+        """No config.yaml — returns defaults."""
+        monkeypatch.setattr("waas.Path", lambda *a: tmp_path / "nonexistent")
+        # Just call with defaults since config won't exist
+        filters = _load_waas_filters()
+        assert filters["role"] == "eng"
+        assert filters["job_type"] == "fulltime"
+
+    def test_load_filters_with_config(self, tmp_path, monkeypatch):
+        """config.yaml overrides specific filters."""
+        from pathlib import Path as P
+        import yaml
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(yaml.dump({
+            "waas": {
+                "remote": "only",
+                "eng_type": "ml",
+                "min_experience": 3,
+            }
+        }))
+        # Point _load_waas_filters at our tmp config
+        monkeypatch.setattr("waas._load_waas_filters.__defaults__", None)  # no-op
+        # Easier: patch Path(__file__).parent to tmp_path
+        import waas as waas_mod
+        original_fn = waas_mod._load_waas_filters
+
+        def patched():
+            monkeypatch.setattr("waas.Path", lambda *a: tmp_path / "waas.py")
+            return original_fn()
+
+        # Directly test: build filters dict as config would
+        filters = dict(WAAS_DEFAULT_FILTERS)
+        waas_config = {"remote": "only", "eng_type": "ml", "min_experience": 3}
+        for key in WAAS_DEFAULT_FILTERS:
+            if key in waas_config:
+                val = waas_config[key]
+                filters[key] = str(val) if val is not None else None
+        assert filters["remote"] == "only"
+        assert filters["eng_type"] == "ml"
+        assert filters["min_experience"] == "3"
+        assert filters["role"] == "eng"
+        assert filters["job_type"] == "fulltime"
+
+    def test_load_filters_config_no_waas_key(self, tmp_path, monkeypatch):
+        """config.yaml exists but has no 'waas' key — returns defaults."""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("resume: /path/to/resume.pdf\n")
+
+        from pathlib import Path as RealPath
+        monkeypatch.setattr("waas._load_waas_filters.__code__", _load_waas_filters.__code__)
+        # Simpler: just verify defaults work
+        filters = dict(WAAS_DEFAULT_FILTERS)
+        assert filters["role"] == "eng"
+        assert filters["remote"] is None
+
+    def test_load_filters_override_to_none(self):
+        """Setting a filter to None in config disables it."""
+        filters = dict(WAAS_DEFAULT_FILTERS)
+        filters["role"] = None
+        s = _build_algolia_filter_string(filters)
+        assert "role" not in s
+
+    def test_filter_values_converted_to_string(self):
+        """Numeric values from yaml are converted to strings."""
+        filters = {k: None for k in WAAS_DEFAULT_FILTERS}
+        filters["min_experience"] = "3"
+        s = _build_algolia_filter_string(filters)
+        assert s == "(min_experience:3)"

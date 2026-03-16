@@ -27,6 +27,52 @@ WAAS_SEEN_FILE = Path(__file__).parent / "seen_waas.json"
 WAAS_PRUNE_DAYS = 180
 WAAS_FETCH_BATCH_SIZE = 10
 
+# Algolia filter defaults. Set to None to disable a filter.
+# Override via config.yaml under "waas" key.
+WAAS_DEFAULT_FILTERS = {
+    "role": "eng",
+    "eng_type": None,        # fs, be, ml, fe, eng_mgmt, devops, embedded, etc.
+    "remote": None,           # yes, only, no
+    "job_type": "fulltime",
+    "min_experience": None,   # 0, 1, 3, 6, 11
+    "us_visa_required": None, # yes, none, possible
+    "has_salary": None,       # true, false
+    "company_waas_stage": None,  # seed, series_a, growth, scale
+}
+
+
+def _load_waas_filters() -> dict:
+    """Load WAAS filters from config.yaml, falling back to defaults."""
+    config_file = Path(__file__).parent / "config.yaml"
+    filters = dict(WAAS_DEFAULT_FILTERS)
+
+    if config_file.exists():
+        try:
+            import yaml
+            with open(config_file) as f:
+                config = yaml.safe_load(f) or {}
+            waas_config = config.get("waas", {})
+            if isinstance(waas_config, dict):
+                for key in WAAS_DEFAULT_FILTERS:
+                    if key in waas_config:
+                        val = waas_config[key]
+                        filters[key] = str(val) if val is not None else None
+        except Exception:
+            logger.debug("Could not load waas filters from config.yaml")
+
+    return filters
+
+
+def _build_algolia_filter_string(filters: dict) -> str:
+    """Build an Algolia filter string from the filters dict."""
+    parts = []
+    for key, value in filters.items():
+        if value is None:
+            continue
+        parts.append(f"({key}:{value})")
+
+    return " AND ".join(parts)
+
 # ---------------------------------------------------------------------------
 # Deduplication
 # ---------------------------------------------------------------------------
@@ -125,15 +171,20 @@ def _scrape_via_api() -> tuple[list[dict], str]:
             logger.warning("Could not extract Algolia key from page")
             return [], ""
 
-        # Step 3: Fetch all company IDs from Algolia (via browser fetch to avoid CORS)
-        logger.info("Fetching company IDs from Algolia...")
+        # Step 3: Build filters and fetch all company IDs from Algolia
+        filters = _load_waas_filters()
+        filter_str = _build_algolia_filter_string(filters)
+        logger.info("Fetching company IDs from Algolia (filters: %s)...", filter_str or "none")
+
         company_ids = page.evaluate("""
-            async (algoliaKey) => {
+            async (args) => {
+                const [algoliaKey, filterStr] = args;
                 const ids = new Set();
                 let currentPage = 0;
                 let nbPages = 1;
 
                 while (currentPage < nbPages) {
+                    const params = `query=&page=${currentPage}&filters=${encodeURIComponent(filterStr)}&attributesToRetrieve=%5B%22company_id%22%5D&attributesToHighlight=%5B%5D&attributesToSnippet=%5B%5D&hitsPerPage=100`;
                     const resp = await fetch('https://45bwzj1sgc-dsn.algolia.net/1/indexes/*/queries', {
                         method: 'POST',
                         headers: {
@@ -144,7 +195,7 @@ def _scrape_via_api() -> tuple[list[dict], str]:
                         body: JSON.stringify({
                             requests: [{
                                 indexName: 'WaaSPublicCompanyJob_production',
-                                params: `query=&page=${currentPage}&filters=&attributesToRetrieve=%5B%22company_id%22%5D&attributesToHighlight=%5B%5D&attributesToSnippet=%5B%5D&hitsPerPage=100`
+                                params: params
                             }]
                         })
                     });
@@ -158,7 +209,7 @@ def _scrape_via_api() -> tuple[list[dict], str]:
                 }
                 return Array.from(ids);
             }
-        """, algolia_key)
+        """, [algolia_key, filter_str])
 
         logger.info("Found %d unique companies in Algolia", len(company_ids))
 

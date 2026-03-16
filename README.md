@@ -41,6 +41,17 @@ preferences:
   notes: |
     I prefer early-stage startups. Looking to work with Rust or Python.
     Not interested in fintech.
+
+# WAAS Algolia filters (all optional, defaults: role=eng, job_type=fulltime)
+waas:
+  # role: eng               # eng, sales, operations, marketing, product
+  # eng_type: ml            # fs, be, ml, fe, eng_mgmt, devops, embedded
+  # remote: only            # yes, only, no
+  # job_type: fulltime      # fulltime, intern, contract, cofounder
+  # min_experience: 3       # 0, 1, 3, 6, 11
+  # us_visa_required: none  # yes, none, possible
+  # has_salary: true        # true, false
+  # company_waas_stage: seed  # seed, series_a, growth, scale
 ```
 
 ### Environment Variables
