@@ -81,11 +81,17 @@ def _scan_hn(months: int, ignore_seen: bool) -> tuple[list[dict], list[dict], li
     return results, filtered_out, thread_titles
 
 
+HN_DESC_LIMIT = 500
+
+
 def _format_hn_results(results: list[dict]) -> list[dict]:
-    """Format HN results for JSON output."""
+    """Format HN results for JSON output. Truncates descriptions to HN_DESC_LIMIT chars."""
     output = []
     for item in results:
         p = item["parsed"]
+        full_text = p["full_text"]
+        if len(full_text) > HN_DESC_LIMIT:
+            full_text = full_text[:HN_DESC_LIMIT] + "..."
         output.append({
             "company": p["company"],
             "location": p["location"],
@@ -93,7 +99,7 @@ def _format_hn_results(results: list[dict]) -> list[dict]:
             "score": item["score"],
             "matched_categories": list(item["matches"].keys()),
             "matched_keywords": [kw for kws in item["matches"].values() for kw in kws],
-            "full_text": p["full_text"],
+            "full_text": full_text,
             "emails": p["emails"],
             "job_board_urls": p["job_board_urls"],
             "other_urls": p["other_urls"],
@@ -103,11 +109,17 @@ def _format_hn_results(results: list[dict]) -> list[dict]:
     return output
 
 
+WAAS_DESC_LIMIT = 500
+
+
 def _format_waas_results(results: list[dict]) -> list[dict]:
-    """Format WAAS results for JSON output."""
+    """Format WAAS results for JSON output. Truncates descriptions to WAAS_DESC_LIMIT chars."""
     output = []
     for item in results:
         p = item["parsed"]
+        full_text = p["full_text"]
+        if len(full_text) > WAAS_DESC_LIMIT:
+            full_text = full_text[:WAAS_DESC_LIMIT] + "..."
         output.append({
             "company": p["company"],
             "location": p["location"],
@@ -115,7 +127,7 @@ def _format_waas_results(results: list[dict]) -> list[dict]:
             "score": item["score"],
             "matched_categories": list(item["matches"].keys()),
             "matched_keywords": [kw for kws in item["matches"].values() for kw in kws],
-            "full_text": p["full_text"],
+            "full_text": full_text,
             "job_url": p["job_board_urls"][0]["url"] if p["job_board_urls"] else "",
             "job_title": p["job_board_urls"][0]["title"] if p["job_board_urls"] else "",
             "salary_range": p.get("salary_range", ""),
@@ -166,10 +178,11 @@ WAAS_MAX_RESULTS = 300
 def scan_waas(ignore_seen: bool = False) -> str:
     """Scan Work at a Startup (workatastartup.com) for matching engineering jobs.
 
-    Returns up to the top 300 results sorted by keyword score, with full
-    job descriptions included. Results are pre-filtered by keyword
-    categories (AI tooling, Systems, General AI+SWE), negative keywords
-    (senior/management), and location (non-US non-remote filtered out).
+    Returns up to the top 300 results sorted by keyword score.
+    Descriptions are truncated to 500 chars — enough for ranking.
+    Results are pre-filtered by keyword categories (AI tooling, Systems,
+    General AI+SWE), negative keywords (senior/management), and location
+    (non-US non-remote filtered out).
 
     Authenticates with YC (requires WAAS_USERNAME/WAAS_PASSWORD env vars).
     Pre-filters at the API level using Algolia (defaults: role=eng,
