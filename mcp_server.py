@@ -336,12 +336,13 @@ def scan_waas(ignore_seen: bool = False, group_by_company: bool = True) -> str:
     job_type=fulltime; configurable via config.yaml under "waas" key or
     via update_config tool).
 
-    Available config.yaml filters under "waas" (use update_config to change):
+    Available config.yaml filters under "waas" (use update_config to change).
+    Use comma-separated values for OR logic (e.g. "0,1" for 0 OR 1 years):
       role: eng|sales|operations|marketing|product|any (default: eng)
       eng_type: fs|be|ml|fe|eng_mgmt|devops|embedded|any (default: any)
       remote: yes|only|no|any (default: any)
       job_type: fulltime|intern|contract|cofounder|any (default: fulltime)
-      min_experience: 0|1|3|6|11|any (default: any)
+      min_experience: 0|1|3|6|11|any — comma-separated for multiple (default: any)
       us_visa_required: yes|none|possible|any (default: any)
       has_salary: true|false|any (default: any)
       company_waas_stage: seed|series_a|growth|scale|any (default: any)
@@ -554,19 +555,20 @@ def update_config(
     Use this to adjust preferences, resume path, or WAAS search filters.
     To disable/clear a WAAS filter, pass "any" as the value (NOT null).
     Omit a field entirely to leave it unchanged.
+    Use comma-separated values for OR logic (e.g. "0,1" for min_experience 0 OR 1).
 
     Args:
         resume: Path to PDF resume file for ranking.
         remote_preference: Remote work preference (e.g. "preferred", "required", "flexible").
         preference_notes: Free-form notes about what you're looking for, sent to the ranker.
         waas_role: WAAS role filter. Values: eng, sales, operations, marketing, product, or "any" to disable/clear.
-        waas_eng_type: WAAS engineering type. Values: fs, be, ml, fe, eng_mgmt, devops, embedded, or "any" to disable/clear.
-        waas_remote: WAAS remote filter. Values: yes, only, no, or "any" to disable/clear.
-        waas_job_type: WAAS job type. Values: fulltime, intern, contract, cofounder, or "any" to disable/clear.
-        waas_min_experience: WAAS min experience. Values: 0, 1, 3, 6, 11, or "any" to disable/clear.
+        waas_eng_type: WAAS engineering type. Values: fs, be, ml, fe, eng_mgmt, devops, embedded, or "any". Comma-separated for multiple.
+        waas_remote: WAAS remote filter. Values: yes, only, no, or "any" to disable/clear. Comma-separated for multiple.
+        waas_job_type: WAAS job type. Values: fulltime, intern, contract, cofounder, or "any". Comma-separated for multiple.
+        waas_min_experience: WAAS min experience (years). Values: 0, 1, 3, 6, 11, or "any". Comma-separated for multiple (e.g. "0,1" for 0-1 years).
         waas_us_visa_required: WAAS visa filter. Values: yes, none, possible, or "any" to disable/clear.
         waas_has_salary: WAAS salary listed filter. Values: true, false, or "any" to disable/clear.
-        waas_company_waas_stage: WAAS company stage. Values: seed, series_a, growth, scale, or "any" to disable/clear.
+        waas_company_waas_stage: WAAS company stage. Values: seed, series_a, growth, scale, or "any". Comma-separated for multiple.
     """
     import yaml
 

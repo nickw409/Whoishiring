@@ -67,12 +67,21 @@ def _load_waas_filters() -> dict:
 
 
 def _build_algolia_filter_string(filters: dict) -> str:
-    """Build an Algolia filter string from the filters dict."""
+    """Build an Algolia filter string from the filters dict.
+
+    Supports comma-separated values for OR logic within a filter.
+    E.g. min_experience: "0,1" becomes (min_experience:0 OR min_experience:1).
+    """
     parts = []
     for key, value in filters.items():
         if not value or value == "any":
             continue
-        parts.append(f"({key}:{value})")
+        values = [v.strip() for v in str(value).split(",")]
+        if len(values) == 1:
+            parts.append(f"({key}:{values[0]})")
+        else:
+            or_clause = " OR ".join(f"{key}:{v}" for v in values)
+            parts.append(f"({or_clause})")
 
     return " AND ".join(parts)
 

@@ -1044,6 +1044,31 @@ class TestAlgoliaFilters:
         s = _build_algolia_filter_string(filters)
         assert s == "(min_experience:3)"
 
+    def test_comma_separated_or_filter(self):
+        """Comma-separated values become OR clauses."""
+        filters = {k: None for k in WAAS_DEFAULT_FILTERS}
+        filters["min_experience"] = "0,1"
+        s = _build_algolia_filter_string(filters)
+        assert s == "(min_experience:0 OR min_experience:1)"
+
+    def test_comma_separated_multiple_values(self):
+        filters = {k: None for k in WAAS_DEFAULT_FILTERS}
+        filters["eng_type"] = "fs,be,ml"
+        s = _build_algolia_filter_string(filters)
+        assert "eng_type:fs" in s
+        assert "eng_type:be" in s
+        assert "eng_type:ml" in s
+        assert " OR " in s
+
+    def test_comma_separated_with_other_filters(self):
+        filters = {k: None for k in WAAS_DEFAULT_FILTERS}
+        filters["role"] = "eng"
+        filters["min_experience"] = "0,1"
+        s = _build_algolia_filter_string(filters)
+        assert "(role:eng)" in s
+        assert "(min_experience:0 OR min_experience:1)" in s
+        assert " AND " in s
+
 
 # ---------------------------------------------------------------------------
 # Seniority estimation
