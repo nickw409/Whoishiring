@@ -9,31 +9,23 @@ import time
 from pathlib import Path
 from typing import Any
 
+import requests as http_requests
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-WAAS_JOBS_URL = "https://www.workatastartup.com/jobs?role=eng"
 WAAS_BASE_URL = "https://www.workatastartup.com"
-WAAS_AUTH_URL = "https://account.ycombinator.com/authenticate?continue=https%3A%2F%2Fwww.workatastartup.com%2Fjobs%3Frole%3Deng"
+WAAS_AUTH_URL = "https://account.ycombinator.com/authenticate?continue=https%3A%2F%2Fwww.workatastartup.com%2Fcompanies"
+WAAS_COMPANIES_URL = "https://www.workatastartup.com/companies?demographic=any&hasEquity=any&hasSalary=any&industry=any&interviewProcess=any&jobType=any&layout=list-compact&sortBy=keyword&tab=any&usVisaNotRequired=any"
+WAAS_FETCH_URL = "https://www.workatastartup.com/companies/fetch"
+WAAS_ALGOLIA_URL = "https://45bwzj1sgc-dsn.algolia.net/1/indexes/*/queries"
+WAAS_ALGOLIA_INDEX = "WaaSPublicCompanyJob_production"
 WAAS_SEEN_FILE = Path(__file__).parent / "seen_waas.json"
 WAAS_PRUNE_DAYS = 180
-WAAS_UNAUTH_LIMIT = 30  # max jobs visible without login
-
-# ---------------------------------------------------------------------------
-# DOM selectors (discovered from live page inspection)
-#
-# Job listing page structure:
-#   div.bg-beige-lighter          — individual job card
-#   div.company-details           — company info container
-#     span.font-bold              — company name + YC batch e.g. "Mason (W16)"
-#     span.text-gray-600          — company one-liner description
-#   a[target="company"]           — link to /companies/<slug>
-#   div.job-name > a              — job title link, href=/jobs/<id>, data-jobid=<id>
-#   p.job-details > span          — detail chips: fulltime, location, role type
-# ---------------------------------------------------------------------------
+WAAS_FETCH_BATCH_SIZE = 10
 
 # ---------------------------------------------------------------------------
 # Deduplication
@@ -77,47 +69,205 @@ def prune_waas_seen(seen: dict[str, dict[str, float]]) -> dict[str, dict[str, fl
 
 
 # ---------------------------------------------------------------------------
-# Browser helpers
+# Auth + API helpers
 # ---------------------------------------------------------------------------
 
-def _create_browser():
-    """Create a Playwright browser instance. Caller must close both."""
-    from playwright.sync_api import sync_playwright
-    playwright = sync_playwright().start()
-    browser = playwright.chromium.launch(headless=True)
-    return playwright, browser
+def _scrape_via_api() -> tuple[list[dict], str]:
+    """Log in, fetch all company IDs via Algolia, fetch company data via page.evaluate.
 
-
-def _waas_login(page) -> bool:
-    """Attempt to log in to WAAS via YC auth. Returns True if successful.
-
-    Requires WAAS_USERNAME and WAAS_PASSWORD env vars. If not set, skips
-    login and returns False (unauthenticated scraping, limited to ~30 jobs).
+    Returns (companies_data, algolia_key). Companies_data is a list of company dicts.
+    Uses Playwright for both auth and API calls to maintain session integrity.
     """
     username = os.environ.get("WAAS_USERNAME", "")
     password = os.environ.get("WAAS_PASSWORD", "")
 
     if not username or not password:
-        return False
+        logger.warning(
+            "WAAS_USERNAME/WAAS_PASSWORD not set. "
+            "Set them in .env for full job listings."
+        )
+        return [], ""
 
-    logger.info("Attempting WAAS login...")
-    page.goto(WAAS_AUTH_URL, timeout=30000)
-    page.wait_for_selector('input[name="username"]', timeout=10000)
+    from playwright.sync_api import sync_playwright
 
-    page.fill('input[name="username"]', username)
-    page.fill('input[name="password"]', password)
-    page.click('button:has-text("Log in")')
+    playwright = None
+    browser = None
+    try:
+        playwright = sync_playwright().start()
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context(viewport={"width": 1920, "height": 1080})
+        page = context.new_page()
 
-    # Wait for navigation — either redirect to jobs page or stay on auth
-    page.wait_for_timeout(3000)
-    current_url = page.url
+        # Step 1: Login
+        logger.info("Attempting WAAS login...")
+        page.goto(WAAS_AUTH_URL, timeout=30000)
+        page.wait_for_selector('input[name="username"]', timeout=10000)
+        page.fill('input[name="username"]', username)
+        page.fill('input[name="password"]', password)
+        page.click('button:has-text("Log in")')
+        page.wait_for_timeout(5000)
 
-    if "account.ycombinator.com" in current_url:
-        logger.warning("WAAS login failed — still on auth page. Check WAAS_USERNAME/WAAS_PASSWORD.")
-        return False
+        if "account.ycombinator.com" in page.url:
+            logger.warning("WAAS login failed — still on auth page. Check credentials.")
+            return [], ""
 
-    logger.info("WAAS login successful")
-    return True
+        logger.info("WAAS login successful")
+
+        # Step 2: Navigate to companies page to get Algolia key + CSRF
+        page.goto(WAAS_COMPANIES_URL, timeout=30000)
+        page.wait_for_timeout(3000)
+
+        # Extract Algolia key from page
+        algolia_key = page.evaluate(
+            "() => window.AlgoliaOpts ? window.AlgoliaOpts.key : ''"
+        )
+        if not algolia_key:
+            logger.warning("Could not extract Algolia key from page")
+            return [], ""
+
+        # Step 3: Fetch all company IDs from Algolia (via browser fetch to avoid CORS)
+        logger.info("Fetching company IDs from Algolia...")
+        company_ids = page.evaluate("""
+            async (algoliaKey) => {
+                const ids = new Set();
+                let currentPage = 0;
+                let nbPages = 1;
+
+                while (currentPage < nbPages) {
+                    const resp = await fetch('https://45bwzj1sgc-dsn.algolia.net/1/indexes/*/queries', {
+                        method: 'POST',
+                        headers: {
+                            'X-Algolia-Application-Id': '45BWZJ1SGC',
+                            'X-Algolia-API-Key': algoliaKey,
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({
+                            requests: [{
+                                indexName: 'WaaSPublicCompanyJob_production',
+                                params: `query=&page=${currentPage}&filters=&attributesToRetrieve=%5B%22company_id%22%5D&attributesToHighlight=%5B%5D&attributesToSnippet=%5B%5D&hitsPerPage=100`
+                            }]
+                        })
+                    });
+                    const data = await resp.json();
+                    const result = data.results[0];
+                    nbPages = result.nbPages;
+                    for (const hit of result.hits) {
+                        if (hit.company_id) ids.add(hit.company_id);
+                    }
+                    currentPage++;
+                }
+                return Array.from(ids);
+            }
+        """, algolia_key)
+
+        logger.info("Found %d unique companies in Algolia", len(company_ids))
+
+        # Step 4: Fetch company data in batches via browser fetch (preserves session/CSRF)
+        all_companies = []
+        batch_size = WAAS_FETCH_BATCH_SIZE
+        for i in range(0, len(company_ids), batch_size):
+            batch = company_ids[i : i + batch_size]
+            try:
+                result = page.evaluate("""
+                    async (ids) => {
+                        const csrfMeta = document.querySelector('meta[name="csrf-token"]');
+                        const csrf = csrfMeta ? csrfMeta.content : '';
+                        const resp = await fetch('/companies/fetch', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Accept': 'application/json',
+                                'X-Requested-With': 'XMLHttpRequest',
+                                'X-CSRF-Token': csrf,
+                            },
+                            body: JSON.stringify({ids: ids}),
+                        });
+                        if (!resp.ok) return {error: resp.status};
+                        return await resp.json();
+                    }
+                """, batch)
+
+                if isinstance(result, dict) and "error" in result:
+                    logger.warning("companies/fetch returned %s for batch at %d", result["error"], i)
+                    continue
+
+                companies = result.get("companies", result) if isinstance(result, dict) else result
+                if isinstance(companies, list):
+                    all_companies.extend(companies)
+
+                time.sleep(0.3)
+            except Exception:
+                logger.warning("Failed to fetch company batch at offset %d", i, exc_info=True)
+                continue
+
+        logger.info("Fetched data for %d companies", len(all_companies))
+        return all_companies, algolia_key
+
+    except Exception as e:
+        logger.warning("WAAS API scrape failed: %s", e, exc_info=True)
+        return [], ""
+    finally:
+        if browser:
+            browser.close()
+        if playwright:
+            playwright.stop()
+
+
+def _company_to_jobs(company: dict) -> list[dict[str, Any]]:
+    """Convert a company API response to a list of flat job dicts."""
+    jobs = []
+    company_name = company.get("name", "")
+    company_url = company.get("website", company.get("website_url", ""))
+    company_description = company.get("description", company.get("one_liner", ""))
+    team_size = company.get("team_size")
+    company_size = f"{team_size} people" if team_size else ""
+    company_yc_batch = company.get("batch", "")
+    slug = company.get("slug", "")
+    waas_company_url = f"{WAAS_BASE_URL}/companies/{slug}" if slug else ""
+
+    for job in company.get("jobs", []):
+        if job.get("state") != "visible":
+            continue
+
+        job_url = job.get("show_path", "")
+        if job_url and not job_url.startswith("http"):
+            job_url = WAAS_BASE_URL + job_url
+
+        remote_val = job.get("remote", "")
+        is_remote = remote_val in ("only", "yes", True) or bool(
+            re.search(r"\bremote\b", job.get("pretty_location_or_remote", ""), re.IGNORECASE)
+        )
+
+        location = job.get("pretty_location_or_remote", "")
+        salary = job.get("pretty_salary_range", "")
+        skills = [s.get("name", "") for s in job.get("skills", []) if s.get("name")]
+
+        job_desc = job.get("description", "")
+        job_type = job.get("pretty_job_type", "")
+        eng_type = job.get("pretty_eng_type", "")
+        experience = job.get("pretty_min_experience", "")
+        visa = job.get("pretty_sponsors_visa", "")
+
+        detail_parts = [p for p in [job_type, location, eng_type, experience, visa] if p]
+
+        jobs.append({
+            "company_name": company_name,
+            "company_url": company_url,
+            "company_description": company_description,
+            "company_size": company_size,
+            "company_yc_batch": company_yc_batch,
+            "waas_company_url": waas_company_url,
+            "job_title": job.get("title", ""),
+            "job_url": job_url,
+            "job_salary_range": salary,
+            "job_location": location,
+            "job_tags": skills,
+            "job_details": " | ".join(detail_parts),
+            "job_description": job_desc,
+            "remote": is_remote,
+        })
+
+    return jobs
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +287,9 @@ def _is_in_asyncio_loop() -> bool:
 def scrape_waas_jobs(ignore_seen: bool = False) -> list[dict[str, Any]]:
     """Scrape engineering jobs from workatastartup.com.
 
+    Uses the WAAS Algolia API + /companies/fetch endpoint for full results.
+    Requires WAAS_USERNAME and WAAS_PASSWORD env vars for authentication.
+
     Args:
         ignore_seen: If True, return all jobs without filtering by seen_waas.json
                      and do NOT update seen_waas.json.
@@ -145,8 +298,6 @@ def scrape_waas_jobs(ignore_seen: bool = False) -> list[dict[str, Any]]:
     company_size, company_yc_batch, waas_company_url, job_title, job_url,
     job_salary_range, job_location, job_tags, job_details, job_description, remote.
     """
-    # Playwright sync API can't run inside asyncio (e.g. MCP server).
-    # Shell out to ourselves as a subprocess in that case.
     if _is_in_asyncio_loop():
         return _scrape_via_subprocess(ignore_seen)
 
@@ -180,158 +331,24 @@ def _scrape_via_subprocess(ignore_seen: bool) -> list[dict[str, Any]]:
 
 
 def _scrape_direct(ignore_seen: bool) -> list[dict[str, Any]]:
-    """Scrape directly using Playwright sync API (not inside asyncio)."""
+    """Scrape via API: login -> Algolia company IDs -> /companies/fetch."""
     seen = load_waas_seen()
     prune_waas_seen(seen)
 
-    playwright = None
-    browser = None
-    jobs = []
-
-    try:
-        playwright, browser = _create_browser()
-        page = browser.new_page()
-
-        # Authenticate if credentials are available
-        authenticated = _waas_login(page)
-
-        # Navigate to jobs page (login may have already redirected there)
-        if WAAS_JOBS_URL not in page.url:
-            page.goto(WAAS_JOBS_URL, timeout=30000)
-        page.wait_for_selector("div.job-name", timeout=15000)
-
-        # Scroll to load all results
-        for _ in range(50):
-            prev_height = page.evaluate("document.body.scrollHeight")
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(1500)
-            new_height = page.evaluate("document.body.scrollHeight")
-            if new_height == prev_height:
-                break
-
-        html = page.content()
-
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html, "html.parser")
-
-        cards = soup.select("div.bg-beige-lighter")
-        for card in cards:
-            try:
-                # Company info
-                company_span = card.find("span", class_="font-bold")
-                company_name_raw = company_span.text.strip() if company_span else ""
-
-                # Extract YC batch from name like "Mason (W16)"
-                batch_match = re.search(r"\(([A-Z]\d{2})\)$", company_name_raw)
-                company_yc_batch = batch_match.group(1) if batch_match else ""
-                company_name = re.sub(r"\s*\([A-Z]\d{2}\)$", "", company_name_raw).strip()
-
-                company_desc_span = card.find("span", class_="text-gray-600")
-                company_description = company_desc_span.text.strip() if company_desc_span else ""
-
-                company_link = card.find("a", attrs={"target": "company"})
-                waas_company_url = ""
-                if company_link and company_link.get("href"):
-                    href = company_link["href"]
-                    waas_company_url = href if href.startswith("http") else WAAS_BASE_URL + href
-
-                # Job info
-                job_div = card.find("div", class_="job-name")
-                if not job_div:
-                    continue
-                job_link = job_div.find("a")
-                if not job_link:
-                    continue
-
-                job_title = job_link.text.strip()
-                job_href = job_link.get("href", "")
-                job_url = job_href if job_href.startswith("http") else WAAS_BASE_URL + job_href
-
-                # Job details from spans
-                details_p = card.find("p", class_="job-details")
-                detail_spans = details_p.find_all("span") if details_p else []
-                detail_texts = [s.text.strip() for s in detail_spans if s.text.strip()]
-
-                job_details = " | ".join(detail_texts)
-                job_tags = detail_texts
-
-                # Location: typically second span in details (first is fulltime/parttime)
-                job_location = ""
-                if len(detail_texts) >= 2:
-                    job_location = detail_texts[1]
-
-                # Remote detection
-                remote = False
-                for text in [job_details, job_location, job_title]:
-                    if re.search(r"\bremote\b", text, re.IGNORECASE):
-                        remote = True
-                        break
-
-                jobs.append({
-                    "company_name": company_name,
-                    "company_url": "",
-                    "company_description": company_description,
-                    "company_size": "",
-                    "company_yc_batch": company_yc_batch,
-                    "waas_company_url": waas_company_url,
-                    "job_title": job_title,
-                    "job_url": job_url,
-                    "job_salary_range": "",
-                    "job_location": job_location,
-                    "job_tags": job_tags,
-                    "job_details": job_details,
-                    "job_description": company_description,
-                    "remote": remote,
-                })
-            except Exception:
-                logger.warning("Failed to parse a job card, skipping", exc_info=True)
-                continue
-
-        if not authenticated and len(jobs) >= WAAS_UNAUTH_LIMIT:
-            logger.warning(
-                "Only %d jobs found (unauthenticated limit). "
-                "Set WAAS_USERNAME and WAAS_PASSWORD env vars for full results.",
-                len(jobs),
-            )
-
-        # Fetch full descriptions from individual job pages
-        logger.info("Fetching descriptions for %d jobs...", len(jobs))
-        for job in jobs:
-            try:
-                page.goto(job["job_url"], timeout=15000)
-                page.wait_for_selector("div.prose", timeout=5000)
-                job_html = page.content()
-                job_soup = BeautifulSoup(job_html, "html.parser")
-
-                # Prose divs: 0=company desc, 1=job desc+skills, 2=tech stack
-                prose_divs = job_soup.select("div.prose")
-                if len(prose_divs) >= 2:
-                    job["job_description"] = prose_divs[1].get_text(strip=True)
-                elif prose_divs:
-                    job["job_description"] = prose_divs[0].get_text(strip=True)
-
-                # Pick up richer location/details from job page
-                detail_div = job_soup.select_one("div.my-2.flex.flex-wrap")
-                if detail_div:
-                    spans = detail_div.find_all("span")
-                    detail_texts = [s.get_text(strip=True) for s in spans if s.get_text(strip=True)]
-                    if detail_texts:
-                        job["job_tags"] = detail_texts
-                        job["job_details"] = " | ".join(detail_texts)
-
-                page.wait_for_timeout(500)  # politeness delay
-            except Exception:
-                logger.debug("Failed to fetch description for %s", job["job_url"])
-                continue
-
-    except Exception as e:
-        logger.warning("WAAS scraping failed: %s", e, exc_info=True)
+    companies, _ = _scrape_via_api()
+    if not companies:
         return []
-    finally:
-        if browser is not None:
-            browser.close()
-        if playwright is not None:
-            playwright.stop()
+
+    # Flatten to job dicts
+    jobs = []
+    for company in companies:
+        try:
+            jobs.extend(_company_to_jobs(company))
+        except Exception:
+            logger.warning("Failed to parse company %s", company.get("name", "?"), exc_info=True)
+            continue
+
+    logger.info("Total jobs extracted: %d", len(jobs))
 
     # Dedup
     if not ignore_seen:

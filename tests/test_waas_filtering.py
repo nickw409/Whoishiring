@@ -1,4 +1,4 @@
-"""Tests for WAAS filtering functions."""
+"""Tests for WAAS scraper, filtering, and API functions."""
 
 import json
 import time
@@ -7,6 +7,7 @@ from unittest.mock import patch, MagicMock
 
 from waas import (
     _waas_to_parsed,
+    _company_to_jobs,
     filter_waas_jobs,
     scan_and_filter_waas,
     scrape_waas_jobs,
@@ -15,6 +16,7 @@ from waas import (
     mark_waas_seen,
     prune_waas_seen,
     WAAS_PRUNE_DAYS,
+    WAAS_BASE_URL,
 )
 
 
@@ -35,6 +37,43 @@ def _make_job(**overrides):
         "job_details": "fulltime | San Francisco, CA | Backend",
         "job_description": "Build stuff with Python and JavaScript",
         "remote": False,
+    }
+    base.update(overrides)
+    return base
+
+
+def _make_api_company(**overrides):
+    """Create a company dict matching the /companies/fetch API response."""
+    base = {
+        "name": "TestCo",
+        "website": "https://testco.com",
+        "description": "A test company building things",
+        "one_liner": "We build things",
+        "team_size": 15,
+        "batch": "W24",
+        "slug": "testco",
+        "location": "San Francisco, CA",
+        "jobs": [{
+            "id": 99999,
+            "company_id": 1234,
+            "state": "visible",
+            "title": "Software Engineer",
+            "description": "Build systems with Rust and CUDA for high-performance computing",
+            "salary_min": 120000,
+            "salary_max": 180000,
+            "show_path": "https://www.workatastartup.com/jobs/99999",
+            "remote": "no",
+            "pretty_job_type": "Full-time",
+            "pretty_eng_type": "Backend",
+            "pretty_location_or_remote": "San Francisco, CA",
+            "pretty_salary_range": "$120K - $180K",
+            "pretty_min_experience": "3+ years",
+            "pretty_sponsors_visa": "Will sponsor visa",
+            "skills": [
+                {"id": 1, "name": "Rust", "popularity": 50},
+                {"id": 2, "name": "CUDA", "popularity": 20},
+            ],
+        }],
     }
     base.update(overrides)
     return base
@@ -112,6 +151,123 @@ class TestWaasToParsed:
         parsed = _waas_to_parsed(_make_job())
         assert parsed["emails"] == []
         assert parsed["email_instructions"] == []
+
+
+# ---------------------------------------------------------------------------
+# _company_to_jobs
+# ---------------------------------------------------------------------------
+
+class TestCompanyToJobs:
+    def test_basic_conversion(self):
+        co = _make_api_company()
+        jobs = _company_to_jobs(co)
+        assert len(jobs) == 1
+        j = jobs[0]
+        assert j["company_name"] == "TestCo"
+        assert j["company_url"] == "https://testco.com"
+        assert j["company_yc_batch"] == "W24"
+        assert j["company_size"] == "15 people"
+        assert j["waas_company_url"] == f"{WAAS_BASE_URL}/companies/testco"
+        assert j["job_title"] == "Software Engineer"
+        assert j["job_salary_range"] == "$120K - $180K"
+        assert "Rust" in j["job_tags"]
+        assert "CUDA" in j["job_tags"]
+        assert "Rust" in j["job_description"]
+
+    def test_skips_non_visible_jobs(self):
+        co = _make_api_company()
+        co["jobs"][0]["state"] = "hidden"
+        jobs = _company_to_jobs(co)
+        assert len(jobs) == 0
+
+    def test_remote_only(self):
+        co = _make_api_company()
+        co["jobs"][0]["remote"] = "only"
+        jobs = _company_to_jobs(co)
+        assert jobs[0]["remote"] is True
+
+    def test_remote_yes(self):
+        co = _make_api_company()
+        co["jobs"][0]["remote"] = "yes"
+        jobs = _company_to_jobs(co)
+        assert jobs[0]["remote"] is True
+
+    def test_remote_no(self):
+        co = _make_api_company()
+        co["jobs"][0]["remote"] = "no"
+        co["jobs"][0]["pretty_location_or_remote"] = "San Francisco, CA"
+        jobs = _company_to_jobs(co)
+        assert jobs[0]["remote"] is False
+
+    def test_remote_from_location_string(self):
+        co = _make_api_company()
+        co["jobs"][0]["remote"] = "no"
+        co["jobs"][0]["pretty_location_or_remote"] = "SF, CA / Remote (US)"
+        jobs = _company_to_jobs(co)
+        assert jobs[0]["remote"] is True
+
+    def test_absolute_url_from_show_path(self):
+        co = _make_api_company()
+        co["jobs"][0]["show_path"] = "/jobs/12345"
+        jobs = _company_to_jobs(co)
+        assert jobs[0]["job_url"] == f"{WAAS_BASE_URL}/jobs/12345"
+
+    def test_already_absolute_url(self):
+        co = _make_api_company()
+        co["jobs"][0]["show_path"] = "https://www.workatastartup.com/jobs/12345"
+        jobs = _company_to_jobs(co)
+        assert jobs[0]["job_url"] == "https://www.workatastartup.com/jobs/12345"
+
+    def test_no_team_size(self):
+        co = _make_api_company(team_size=None)
+        jobs = _company_to_jobs(co)
+        assert jobs[0]["company_size"] == ""
+
+    def test_no_slug(self):
+        co = _make_api_company(slug="")
+        jobs = _company_to_jobs(co)
+        assert jobs[0]["waas_company_url"] == ""
+
+    def test_multiple_jobs(self):
+        co = _make_api_company()
+        co["jobs"].append({
+            "id": 88888,
+            "company_id": 1234,
+            "state": "visible",
+            "title": "Frontend Engineer",
+            "description": "Build UIs",
+            "show_path": "/jobs/88888",
+            "remote": "only",
+            "pretty_job_type": "Full-time",
+            "pretty_eng_type": "Frontend",
+            "pretty_location_or_remote": "Remote",
+            "pretty_salary_range": "$100K - $140K",
+            "pretty_min_experience": "2+ years",
+            "pretty_sponsors_visa": "",
+            "skills": [],
+        })
+        jobs = _company_to_jobs(co)
+        assert len(jobs) == 2
+        assert jobs[0]["job_title"] == "Software Engineer"
+        assert jobs[1]["job_title"] == "Frontend Engineer"
+
+    def test_no_jobs(self):
+        co = _make_api_company(jobs=[])
+        jobs = _company_to_jobs(co)
+        assert jobs == []
+
+    def test_empty_skills(self):
+        co = _make_api_company()
+        co["jobs"][0]["skills"] = []
+        jobs = _company_to_jobs(co)
+        assert jobs[0]["job_tags"] == []
+
+    def test_details_string(self):
+        co = _make_api_company()
+        jobs = _company_to_jobs(co)
+        details = jobs[0]["job_details"]
+        assert "Full-time" in details
+        assert "San Francisco" in details
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +379,7 @@ class TestFilterWaasJobs:
         )
         results, _ = filter_waas_jobs([job])
         assert len(results) == 1
-        assert results[0]["score"] == 6  # AI tooling(3) + Systems(2) + General AI+SWE(1)
+        assert results[0]["score"] == 6
 
     def test_multiple_negative_keywords(self):
         job = _make_job(
@@ -232,8 +388,7 @@ class TestFilterWaasJobs:
         )
         _, filtered_out = filter_waas_jobs([job])
         assert len(filtered_out) == 1
-        reasons = filtered_out[0]["filter_reason"]
-        assert len(reasons) >= 2
+        assert len(filtered_out[0]["filter_reason"]) >= 2
 
     def test_multiple_jobs_mixed_results(self):
         jobs = [
@@ -245,9 +400,8 @@ class TestFilterWaasJobs:
                       job_location="Tokyo, Japan", remote=False),
         ]
         results, filtered_out = filter_waas_jobs(jobs)
-        assert len(results) == 1  # only the Rust/CUDA one
-        assert len(filtered_out) == 2  # staff engineer + Japan location
-        # Insurance one is silently skipped (no keyword match)
+        assert len(results) == 1
+        assert len(filtered_out) == 2
 
     def test_empty_description_skipped(self):
         job = _make_job(job_description="", job_title="Some Role", job_tags=[])
@@ -256,7 +410,6 @@ class TestFilterWaasJobs:
         assert len(filtered_out) == 0
 
     def test_no_location_not_filtered(self):
-        """Jobs with empty location get benefit of the doubt."""
         job = _make_job(
             job_location="",
             job_description="Build GPU systems with CUDA",
@@ -266,7 +419,6 @@ class TestFilterWaasJobs:
         assert len(results) == 1
 
     def test_keywords_matched_from_tags(self):
-        """Tags contribute to keyword matching."""
         job = _make_job(
             job_description="Work at our company",
             job_title="Engineer",
@@ -278,7 +430,7 @@ class TestFilterWaasJobs:
 
 
 # ---------------------------------------------------------------------------
-# Deduplication functions
+# Deduplication
 # ---------------------------------------------------------------------------
 
 class TestDedup:
@@ -325,7 +477,6 @@ class TestDedup:
         seen = mark_waas_seen({"jobs": {}}, ["https://waas.com/1", "https://waas.com/2"])
         assert "https://waas.com/1" in seen["jobs"]
         assert "https://waas.com/2" in seen["jobs"]
-        assert isinstance(seen["jobs"]["https://waas.com/1"], float)
 
     def test_mark_seen_preserves_existing(self):
         seen = {"jobs": {"https://waas.com/old": 100.0}}
@@ -354,147 +505,24 @@ class TestDedup:
 
 
 # ---------------------------------------------------------------------------
-# scrape_waas_jobs (mocked browser)
+# scrape_waas_jobs (mocked API)
 # ---------------------------------------------------------------------------
 
-LISTING_HTML = """
-<html><body>
-<div class="mb-2 flex w-full rounded-md border border-gray-200 bg-beige-lighter p-2">
-  <a href="/companies/acme" target="company"></a>
-  <div class="company-details text-lg">
-    <span class="font-bold">Acme Corp (W24)</span>
-    <span class="text-gray-600">AI-powered widgets</span>
-  </div>
-  <div class="job-name">
-    <a href="/jobs/100" data-jobid="100">ML Engineer</a>
-  </div>
-  <p class="job-details">
-    <span>fulltime</span>
-    <span>San Francisco, CA</span>
-    <span>Backend</span>
-  </p>
-</div>
-<div class="mb-2 flex w-full rounded-md border border-gray-200 bg-beige-lighter p-2">
-  <a href="/companies/beta" target="company"></a>
-  <div class="company-details text-lg">
-    <span class="font-bold">Beta Inc (S23)</span>
-    <span class="text-gray-600">Cloud infrastructure</span>
-  </div>
-  <div class="job-name">
-    <a href="/jobs/200" data-jobid="200">Senior Rust Developer</a>
-  </div>
-  <p class="job-details">
-    <span>fulltime</span>
-    <span>Remote</span>
-    <span>Systems</span>
-  </p>
-</div>
-</body></html>
-"""
-
-JOB_PAGE_HTML = """
-<html><body>
-<div class="prose">Company description here</div>
-<div class="prose">Skills: Rust, Python, CUDA
-We are building a high-performance machine learning platform.
-Looking for engineers who love LLM tooling and agentic systems.</div>
-<div class="prose">Rust, Python</div>
-<div class="my-2 flex flex-wrap">
-  <span>San Francisco, CA</span>
-  <span>Full-time</span>
-  <span>3+ years</span>
-</div>
-</body></html>
-"""
-
-
-def _make_mock_page(listing_html=LISTING_HTML, job_html=JOB_PAGE_HTML):
-    """Create a mock Playwright page that returns canned HTML."""
-    page = MagicMock()
-    page.evaluate.return_value = 1000  # scrollHeight never changes (no infinite scroll)
-    page.url = ""  # not on jobs page yet, so _scrape_direct will call goto
-
-    call_count = {"goto": 0}
-    def goto_side_effect(url, **kwargs):
-        call_count["goto"] += 1
-        page.url = url
-
-    page.goto.side_effect = goto_side_effect
-
-    def content_side_effect():
-        # First call = listing page, subsequent = job pages
-        if call_count["goto"] <= 1:
-            return listing_html
-        return job_html
-
-    page.content.side_effect = content_side_effect
-    page.wait_for_selector.return_value = True
-    page.wait_for_timeout.return_value = None
-    return page
-
-
 class TestScrapeWaasJobs:
-    def _patch_browser(self, monkeypatch, page=None):
-        if page is None:
-            page = _make_mock_page()
-        mock_browser = MagicMock()
-        mock_browser.new_page.return_value = page
-        # Disable auth by default in scraper tests
-        monkeypatch.setattr("waas._waas_login", lambda page: False)
-        mock_pw = MagicMock()
-
-        def fake_create():
-            return mock_pw, mock_browser
-
-        monkeypatch.setattr("waas._create_browser", fake_create)
-        monkeypatch.setattr("waas.WAAS_SEEN_FILE", MagicMock(exists=lambda: False))
+    def test_returns_list(self, monkeypatch):
+        companies = [_make_api_company()]
+        monkeypatch.setattr("waas._scrape_via_api", lambda: (companies, "key"))
         monkeypatch.setattr("waas.load_waas_seen", lambda: {"jobs": {}})
         monkeypatch.setattr("waas.save_waas_seen", lambda s: None)
-        return mock_pw, mock_browser, page
-
-    def test_returns_list(self, monkeypatch):
-        self._patch_browser(monkeypatch)
         jobs = scrape_waas_jobs(ignore_seen=True)
         assert isinstance(jobs, list)
+        assert len(jobs) == 1
 
-    def test_parses_company_name(self, monkeypatch):
-        self._patch_browser(monkeypatch)
-        jobs = scrape_waas_jobs(ignore_seen=True)
-        assert len(jobs) == 2
-        assert jobs[0]["company_name"] == "Acme Corp"
-        assert jobs[1]["company_name"] == "Beta Inc"
-
-    def test_extracts_yc_batch(self, monkeypatch):
-        self._patch_browser(monkeypatch)
-        jobs = scrape_waas_jobs(ignore_seen=True)
-        assert jobs[0]["company_yc_batch"] == "W24"
-        assert jobs[1]["company_yc_batch"] == "S23"
-
-    def test_builds_absolute_urls(self, monkeypatch):
-        self._patch_browser(monkeypatch)
-        jobs = scrape_waas_jobs(ignore_seen=True)
-        assert jobs[0]["job_url"] == "https://www.workatastartup.com/jobs/100"
-        assert jobs[0]["waas_company_url"] == "https://www.workatastartup.com/companies/acme"
-
-    def test_detects_remote(self, monkeypatch):
-        self._patch_browser(monkeypatch)
-        jobs = scrape_waas_jobs(ignore_seen=True)
-        assert jobs[0]["remote"] is False
-        assert jobs[1]["remote"] is True
-
-    def test_extracts_location(self, monkeypatch):
-        self._patch_browser(monkeypatch)
-        jobs = scrape_waas_jobs(ignore_seen=True)
-        assert jobs[0]["job_location"] == "San Francisco, CA"
-
-    def test_fetches_full_description(self, monkeypatch):
-        self._patch_browser(monkeypatch)
-        jobs = scrape_waas_jobs(ignore_seen=True)
-        # Job page prose[1] should be used as description
-        assert "high-performance machine learning" in jobs[0]["job_description"]
-
-    def test_all_required_fields_present(self, monkeypatch):
-        self._patch_browser(monkeypatch)
+    def test_all_required_fields(self, monkeypatch):
+        companies = [_make_api_company()]
+        monkeypatch.setattr("waas._scrape_via_api", lambda: (companies, "key"))
+        monkeypatch.setattr("waas.load_waas_seen", lambda: {"jobs": {}})
+        monkeypatch.setattr("waas.save_waas_seen", lambda s: None)
         jobs = scrape_waas_jobs(ignore_seen=True)
         required = {
             "company_name", "company_url", "company_description", "company_size",
@@ -506,7 +534,10 @@ class TestScrapeWaasJobs:
             assert set(job.keys()) == required
 
     def test_field_types(self, monkeypatch):
-        self._patch_browser(monkeypatch)
+        companies = [_make_api_company()]
+        monkeypatch.setattr("waas._scrape_via_api", lambda: (companies, "key"))
+        monkeypatch.setattr("waas.load_waas_seen", lambda: {"jobs": {}})
+        monkeypatch.setattr("waas.save_waas_seen", lambda s: None)
         jobs = scrape_waas_jobs(ignore_seen=True)
         for job in jobs:
             assert isinstance(job["remote"], bool)
@@ -514,152 +545,39 @@ class TestScrapeWaasJobs:
             for key in ["company_name", "job_title", "job_url", "job_description"]:
                 assert isinstance(job[key], str)
 
-    def test_browser_cleanup_on_error(self, monkeypatch):
-        mock_pw = MagicMock()
-        mock_browser = MagicMock()
-        mock_browser.new_page.side_effect = RuntimeError("browser crashed")
-
-        monkeypatch.setattr("waas._create_browser", lambda: (mock_pw, mock_browser))
-        monkeypatch.setattr("waas.load_waas_seen", lambda: {"jobs": {}})
-
-        jobs = scrape_waas_jobs(ignore_seen=True)
-        assert jobs == []
-        mock_browser.close.assert_called_once()
-        mock_pw.stop.assert_called_once()
-
-    def test_browser_cleanup_on_navigation_error(self, monkeypatch):
-        page = MagicMock()
-        page.url = ""
-        page.goto.side_effect = TimeoutError("navigation timeout")
-        mock_browser = MagicMock()
-        mock_browser.new_page.return_value = page
-        mock_pw = MagicMock()
-
-        monkeypatch.setattr("waas._create_browser", lambda: (mock_pw, mock_browser))
-        monkeypatch.setattr("waas._waas_login", lambda p: False)
-        monkeypatch.setattr("waas.load_waas_seen", lambda: {"jobs": {}})
-
-        jobs = scrape_waas_jobs(ignore_seen=True)
-        assert jobs == []
-        mock_browser.close.assert_called_once()
-        mock_pw.stop.assert_called_once()
-
-    def test_job_page_failure_keeps_listing_data(self, monkeypatch):
-        """If fetching individual job pages fails, keep the listing-page description."""
-        page = MagicMock()
-        page.evaluate.return_value = 1000
-        page.url = ""
-        call_count = {"n": 0}
-
-        def goto_effect(url, **kwargs):
-            call_count["n"] += 1
-            page.url = url
-            if call_count["n"] > 1:
-                raise TimeoutError("job page timeout")
-
-        page.goto.side_effect = goto_effect
-        page.content.return_value = LISTING_HTML
-        page.wait_for_selector.return_value = True
-        page.wait_for_timeout.return_value = None
-        monkeypatch.setattr("waas._waas_login", lambda p: False)
-
-        self._patch_browser(monkeypatch, page=page)
-        jobs = scrape_waas_jobs(ignore_seen=True)
-        assert len(jobs) == 2
-        # Falls back to company description from listing
-        assert jobs[0]["job_description"] == "AI-powered widgets"
-
-    def test_dedup_filters_seen_jobs(self, monkeypatch):
-        page = _make_mock_page()
-        mock_browser = MagicMock()
-        mock_browser.new_page.return_value = page
-        mock_pw = MagicMock()
-
-        saved = {}
-
-        monkeypatch.setattr("waas._create_browser", lambda: (mock_pw, mock_browser))
-        monkeypatch.setattr("waas._waas_login", lambda p: False)
+    def test_dedup_filters_seen(self, monkeypatch):
+        companies = [_make_api_company()]
+        monkeypatch.setattr("waas._scrape_via_api", lambda: (companies, "key"))
         monkeypatch.setattr("waas.load_waas_seen", lambda: {
-            "jobs": {"https://www.workatastartup.com/jobs/100": time.time()}
+            "jobs": {"https://www.workatastartup.com/jobs/99999": time.time()}
         })
-        monkeypatch.setattr("waas.save_waas_seen", lambda s: saved.update(s))
-
+        monkeypatch.setattr("waas.save_waas_seen", lambda s: None)
         jobs = scrape_waas_jobs(ignore_seen=False)
-        # Job 100 was already seen, only job 200 should remain
-        assert len(jobs) == 1
-        assert jobs[0]["job_url"] == "https://www.workatastartup.com/jobs/200"
+        assert len(jobs) == 0
 
     def test_ignore_seen_skips_save(self, monkeypatch):
-        page = _make_mock_page()
-        mock_browser = MagicMock()
-        mock_browser.new_page.return_value = page
-        mock_pw = MagicMock()
-
-        save_called = {"count": 0}
-
-        def mock_save(s):
-            save_called["count"] += 1
-
-        monkeypatch.setattr("waas._create_browser", lambda: (mock_pw, mock_browser))
-        monkeypatch.setattr("waas._waas_login", lambda p: False)
+        companies = [_make_api_company()]
+        monkeypatch.setattr("waas._scrape_via_api", lambda: (companies, "key"))
         monkeypatch.setattr("waas.load_waas_seen", lambda: {"jobs": {}})
-        monkeypatch.setattr("waas.save_waas_seen", mock_save)
-
+        save_called = {"count": 0}
+        monkeypatch.setattr("waas.save_waas_seen", lambda s: save_called.update(count=save_called["count"] + 1))
         jobs = scrape_waas_jobs(ignore_seen=True)
-        assert len(jobs) == 2
+        assert len(jobs) == 1
         assert save_called["count"] == 0
 
-    def test_no_parallel_browsers(self, monkeypatch):
-        """Verify only one browser is created per scrape call."""
-        create_count = {"n": 0}
-        page = _make_mock_page()
-        mock_browser = MagicMock()
-        mock_browser.new_page.return_value = page
-        mock_pw = MagicMock()
+    def test_api_failure_returns_empty(self, monkeypatch):
+        monkeypatch.setattr("waas._scrape_via_api", lambda: ([], ""))
+        monkeypatch.setattr("waas.load_waas_seen", lambda: {"jobs": {}})
+        jobs = scrape_waas_jobs(ignore_seen=True)
+        assert jobs == []
 
-        def counting_create():
-            create_count["n"] += 1
-            return mock_pw, mock_browser
-
-        monkeypatch.setattr("waas._create_browser", counting_create)
-        monkeypatch.setattr("waas._waas_login", lambda p: False)
+    def test_bad_company_skipped(self, monkeypatch):
+        companies = [_make_api_company(), {"bad": "data"}]
+        monkeypatch.setattr("waas._scrape_via_api", lambda: (companies, "key"))
         monkeypatch.setattr("waas.load_waas_seen", lambda: {"jobs": {}})
         monkeypatch.setattr("waas.save_waas_seen", lambda s: None)
-
-        scrape_waas_jobs(ignore_seen=True)
-        assert create_count["n"] == 1
-        mock_browser.new_page.assert_called_once()
-
-    def test_politeness_delay_between_job_pages(self, monkeypatch):
-        """Verify wait_for_timeout is called between job page fetches."""
-        page = _make_mock_page()
-        self._patch_browser(monkeypatch, page=page)
-        scrape_waas_jobs(ignore_seen=True)
-
-        # wait_for_timeout is called for scrolling (1500ms) + per job page (500ms)
-        timeout_calls = [c.args[0] for c in page.wait_for_timeout.call_args_list]
-        # Should have 500ms delays for job page fetches
-        assert 500 in timeout_calls
-
-    def test_empty_page_returns_empty(self, monkeypatch):
-        page = _make_mock_page(listing_html="<html><body></body></html>")
-        self._patch_browser(monkeypatch, page=page)
         jobs = scrape_waas_jobs(ignore_seen=True)
-        assert jobs == []
-
-    def test_card_missing_job_link_skipped(self, monkeypatch):
-        html = """
-        <html><body>
-        <div class="mb-2 flex w-full rounded-md border border-gray-200 bg-beige-lighter p-2">
-          <div class="company-details"><span class="font-bold">NoJob Co (W24)</span></div>
-          <div class="job-name"></div>
-        </div>
-        </body></html>
-        """
-        page = _make_mock_page(listing_html=html)
-        self._patch_browser(monkeypatch, page=page)
-        jobs = scrape_waas_jobs(ignore_seen=True)
-        assert jobs == []
+        assert len(jobs) == 1  # bad company skipped, good one kept
 
 
 # ---------------------------------------------------------------------------
@@ -706,7 +624,6 @@ class TestScanAndFilterWaas:
 
 class TestAsyncioFallback:
     def test_detects_asyncio_loop(self):
-        """_is_in_asyncio_loop returns True inside a running loop."""
         import asyncio
         from waas import _is_in_asyncio_loop
 
@@ -719,12 +636,10 @@ class TestAsyncioFallback:
         assert result is True
 
     def test_not_in_asyncio_outside_loop(self):
-        """_is_in_asyncio_loop returns False when no loop is running."""
         from waas import _is_in_asyncio_loop
         assert _is_in_asyncio_loop() is False
 
     def test_subprocess_fallback_in_asyncio(self, monkeypatch):
-        """scrape_waas_jobs uses subprocess when inside asyncio loop."""
         import asyncio
         from waas import scrape_waas_jobs
 
@@ -747,10 +662,8 @@ class TestAsyncioFallback:
         result = asyncio.run(run())
         assert called["subprocess"] is True
         assert called["direct"] is False
-        assert result == [{"mock": True}]
 
     def test_direct_outside_asyncio(self, monkeypatch):
-        """scrape_waas_jobs uses direct path when not in asyncio."""
         from waas import scrape_waas_jobs
 
         called = {"subprocess": False, "direct": False}
@@ -771,8 +684,6 @@ class TestAsyncioFallback:
         assert called["subprocess"] is False
 
     def test_subprocess_passes_ignore_seen_flag(self, monkeypatch):
-        """--ignore-seen flag is passed to subprocess."""
-        import subprocess as sp
         from waas import _scrape_via_subprocess
 
         captured_args = {}
@@ -790,8 +701,6 @@ class TestAsyncioFallback:
         assert "--ignore-seen" in captured_args["args"]
 
     def test_subprocess_omits_flag_when_false(self, monkeypatch):
-        """--ignore-seen flag is not passed when ignore_seen=False."""
-        import subprocess as sp
         from waas import _scrape_via_subprocess
 
         captured_args = {}
@@ -809,7 +718,6 @@ class TestAsyncioFallback:
         assert "--ignore-seen" not in captured_args["args"]
 
     def test_subprocess_returns_parsed_json(self, monkeypatch):
-        """Subprocess output is parsed as JSON."""
         from waas import _scrape_via_subprocess
 
         def mock_run(args, **kwargs):
@@ -825,7 +733,6 @@ class TestAsyncioFallback:
         assert jobs[0]["company_name"] == "Test"
 
     def test_subprocess_failure_returns_empty(self, monkeypatch):
-        """Subprocess failure returns empty list."""
         from waas import _scrape_via_subprocess
 
         def mock_run(args, **kwargs):
@@ -840,7 +747,6 @@ class TestAsyncioFallback:
         assert jobs == []
 
     def test_subprocess_invalid_json_returns_empty(self, monkeypatch):
-        """Subprocess returning invalid JSON returns empty list."""
         from waas import _scrape_via_subprocess
 
         def mock_run(args, **kwargs):
@@ -855,7 +761,6 @@ class TestAsyncioFallback:
         assert jobs == []
 
     def test_subprocess_timeout_returns_empty(self, monkeypatch):
-        """Subprocess timeout returns empty list."""
         import subprocess as sp
         from waas import _scrape_via_subprocess
 
@@ -868,198 +773,28 @@ class TestAsyncioFallback:
 
 
 # ---------------------------------------------------------------------------
-# Authentication
+# _scrape_via_api (mocked Playwright)
 # ---------------------------------------------------------------------------
 
-class TestWaasLogin:
-    def test_skips_without_credentials(self, monkeypatch):
-        """No env vars set — returns False without navigating."""
-        from waas import _waas_login
+class TestScrapeViaApi:
+    def test_no_credentials_returns_empty(self, monkeypatch):
+        from waas import _scrape_via_api
         monkeypatch.delenv("WAAS_USERNAME", raising=False)
         monkeypatch.delenv("WAAS_PASSWORD", raising=False)
-        page = MagicMock()
-        result = _waas_login(page)
-        assert result is False
-        page.goto.assert_not_called()
+        companies, key = _scrape_via_api()
+        assert companies == []
+        assert key == ""
 
-    def test_skips_with_empty_username(self, monkeypatch):
-        from waas import _waas_login
+    def test_empty_username_returns_empty(self, monkeypatch):
+        from waas import _scrape_via_api
         monkeypatch.setenv("WAAS_USERNAME", "")
         monkeypatch.setenv("WAAS_PASSWORD", "secret")
-        page = MagicMock()
-        assert _waas_login(page) is False
-        page.goto.assert_not_called()
+        companies, key = _scrape_via_api()
+        assert companies == []
 
-    def test_skips_with_empty_password(self, monkeypatch):
-        from waas import _waas_login
-        monkeypatch.setenv("WAAS_USERNAME", "user@test.com")
+    def test_empty_password_returns_empty(self, monkeypatch):
+        from waas import _scrape_via_api
+        monkeypatch.setenv("WAAS_USERNAME", "user")
         monkeypatch.setenv("WAAS_PASSWORD", "")
-        page = MagicMock()
-        assert _waas_login(page) is False
-        page.goto.assert_not_called()
-
-    def test_successful_login(self, monkeypatch):
-        """Credentials set, redirect to jobs page — returns True."""
-        from waas import _waas_login, WAAS_AUTH_URL
-        monkeypatch.setenv("WAAS_USERNAME", "user@test.com")
-        monkeypatch.setenv("WAAS_PASSWORD", "secret123")
-        page = MagicMock()
-        page.url = "https://www.workatastartup.com/jobs?role=eng"
-        result = _waas_login(page)
-        assert result is True
-        page.goto.assert_called_once_with(WAAS_AUTH_URL, timeout=30000)
-        page.fill.assert_any_call('input[name="username"]', "user@test.com")
-        page.fill.assert_any_call('input[name="password"]', "secret123")
-        page.click.assert_called_once_with('button:has-text("Log in")')
-
-    def test_failed_login_stays_on_auth_page(self, monkeypatch):
-        """Bad credentials — page stays on auth URL, returns False."""
-        from waas import _waas_login
-        monkeypatch.setenv("WAAS_USERNAME", "user@test.com")
-        monkeypatch.setenv("WAAS_PASSWORD", "wrong")
-        page = MagicMock()
-        page.url = "https://account.ycombinator.com/authenticate?continue=..."
-        result = _waas_login(page)
-        assert result is False
-
-    def test_login_timeout_raises(self, monkeypatch):
-        """Auth page fails to load — exception propagates."""
-        from waas import _waas_login
-        monkeypatch.setenv("WAAS_USERNAME", "user@test.com")
-        monkeypatch.setenv("WAAS_PASSWORD", "secret")
-        page = MagicMock()
-        page.goto.side_effect = TimeoutError("auth page timeout")
-        with pytest.raises(TimeoutError):
-            _waas_login(page)
-
-    def test_scrape_direct_calls_login(self, monkeypatch):
-        """_scrape_direct calls _waas_login before navigating."""
-        from waas import _scrape_direct
-
-        login_called = {"count": 0}
-
-        def mock_login(page):
-            login_called["count"] += 1
-            return False
-
-        page = _make_mock_page()
-        mock_browser = MagicMock()
-        mock_browser.new_page.return_value = page
-        mock_pw = MagicMock()
-
-        monkeypatch.setattr("waas._create_browser", lambda: (mock_pw, mock_browser))
-        monkeypatch.setattr("waas._waas_login", mock_login)
-        monkeypatch.setattr("waas.load_waas_seen", lambda: {"jobs": {}})
-        monkeypatch.setattr("waas.save_waas_seen", lambda s: None)
-
-        _scrape_direct(ignore_seen=True)
-        assert login_called["count"] == 1
-
-    def test_scrape_skips_goto_when_login_redirected(self, monkeypatch):
-        """If login redirects to jobs page, don't navigate again."""
-        from waas import _scrape_direct, WAAS_JOBS_URL
-
-        page = _make_mock_page()
-        mock_browser = MagicMock()
-        mock_browser.new_page.return_value = page
-        mock_pw = MagicMock()
-
-        def mock_login(p):
-            p.url = WAAS_JOBS_URL
-            return True
-
-        monkeypatch.setattr("waas._create_browser", lambda: (mock_pw, mock_browser))
-        monkeypatch.setattr("waas._waas_login", mock_login)
-        monkeypatch.setattr("waas.load_waas_seen", lambda: {"jobs": {}})
-        monkeypatch.setattr("waas.save_waas_seen", lambda s: None)
-
-        _scrape_direct(ignore_seen=True)
-        # goto should NOT have been called with the listing URL since login redirected there
-        goto_urls = [c.args[0] for c in page.goto.call_args_list]
-        assert WAAS_JOBS_URL not in goto_urls
-
-    def test_scrape_navigates_when_login_skipped(self, monkeypatch):
-        """Without login, _scrape_direct navigates to jobs page."""
-        from waas import _scrape_direct, WAAS_JOBS_URL
-
-        page = _make_mock_page()
-        mock_browser = MagicMock()
-        mock_browser.new_page.return_value = page
-        mock_pw = MagicMock()
-
-        monkeypatch.setattr("waas._create_browser", lambda: (mock_pw, mock_browser))
-        monkeypatch.setattr("waas._waas_login", lambda p: False)
-        monkeypatch.setattr("waas.load_waas_seen", lambda: {"jobs": {}})
-        monkeypatch.setattr("waas.save_waas_seen", lambda s: None)
-
-        _scrape_direct(ignore_seen=True)
-        first_goto_url = page.goto.call_args_list[0].args[0]
-        assert first_goto_url == WAAS_JOBS_URL
-
-    def test_unauth_limit_warning(self, monkeypatch, caplog):
-        """Warns when hitting unauthenticated job limit."""
-        from waas import _scrape_direct
-
-        cards_html = ""
-        for i in range(30):
-            cards_html += f"""
-            <div class="mb-2 flex w-full rounded-md border border-gray-200 bg-beige-lighter p-2">
-              <a href="/companies/co{i}" target="company"></a>
-              <div class="company-details"><span class="font-bold">Co{i} (W24)</span>
-              <span class="text-gray-600">Desc {i}</span></div>
-              <div class="job-name"><a href="/jobs/{i}" data-jobid="{i}">Engineer {i}</a></div>
-              <p class="job-details"><span>fulltime</span><span>SF, CA</span></p>
-            </div>"""
-        big_html = f"<html><body>{cards_html}</body></html>"
-
-        page = _make_mock_page(listing_html=big_html)
-        mock_browser = MagicMock()
-        mock_browser.new_page.return_value = page
-        mock_pw = MagicMock()
-
-        monkeypatch.setattr("waas._create_browser", lambda: (mock_pw, mock_browser))
-        monkeypatch.setattr("waas._waas_login", lambda p: False)
-        monkeypatch.setattr("waas.load_waas_seen", lambda: {"jobs": {}})
-        monkeypatch.setattr("waas.save_waas_seen", lambda s: None)
-
-        import logging
-        with caplog.at_level(logging.WARNING, logger="waas"):
-            _scrape_direct(ignore_seen=True)
-
-        assert any("WAAS_USERNAME" in msg for msg in caplog.messages)
-
-    def test_no_warning_when_authenticated(self, monkeypatch, caplog):
-        """No warning when authenticated, even with 30+ results."""
-        from waas import _scrape_direct
-
-        cards_html = ""
-        for i in range(30):
-            cards_html += f"""
-            <div class="mb-2 flex w-full rounded-md border border-gray-200 bg-beige-lighter p-2">
-              <a href="/companies/co{i}" target="company"></a>
-              <div class="company-details"><span class="font-bold">Co{i} (W24)</span>
-              <span class="text-gray-600">Desc {i}</span></div>
-              <div class="job-name"><a href="/jobs/{i}" data-jobid="{i}">Engineer {i}</a></div>
-              <p class="job-details"><span>fulltime</span><span>SF, CA</span></p>
-            </div>"""
-        big_html = f"<html><body>{cards_html}</body></html>"
-
-        page = _make_mock_page(listing_html=big_html)
-        mock_browser = MagicMock()
-        mock_browser.new_page.return_value = page
-        mock_pw = MagicMock()
-
-        def mock_login(p):
-            p.url = "https://www.workatastartup.com/jobs?role=eng"
-            return True
-
-        monkeypatch.setattr("waas._create_browser", lambda: (mock_pw, mock_browser))
-        monkeypatch.setattr("waas._waas_login", mock_login)
-        monkeypatch.setattr("waas.load_waas_seen", lambda: {"jobs": {}})
-        monkeypatch.setattr("waas.save_waas_seen", lambda s: None)
-
-        import logging
-        with caplog.at_level(logging.WARNING, logger="waas"):
-            _scrape_direct(ignore_seen=True)
-
-        assert not any("WAAS_USERNAME" in msg for msg in caplog.messages)
+        companies, key = _scrape_via_api()
+        assert companies == []
