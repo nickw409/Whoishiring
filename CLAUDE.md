@@ -94,6 +94,9 @@ Exposes the scan pipeline to Claude Desktop via the Model Context Protocol (stdi
 - `get_preferences()` — returns preferences from config.yaml
 - `get_latest_results()` — returns most recent saved results JSON
 
+### Prompts
+Server registers MCP prompts (`find_jobs`, `rerank_results`, `scan_overview`, `backfill`) but Claude Desktop does not surface them in its UI as of March 2026. They are returned via `prompts/list` but ignored by the client.
+
 ### Key Details
 - Server imports from `hn_jobs.py` — all pipeline logic lives there, MCP server is just the interface
 - `ignore_seen` skips dedup AND does not update `seen_posts.json` (avoids polluting the seen list)

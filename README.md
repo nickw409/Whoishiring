@@ -110,6 +110,10 @@ Restart Claude Desktop after adding the config.
 | `get_preferences` | Return job preferences from config.yaml |
 | `get_latest_results` | Return most recent saved results without re-scanning |
 
+### Prompts
+
+The MCP server registers prompt templates (`find_jobs`, `rerank_results`, `scan_overview`, `backfill`) that should appear as slash commands in the client. **Note:** As of March 2026, Claude Desktop (claude.ai) does not surface MCP prompts in its UI. The prompts are returned via `prompts/list` but the client ignores them. Use the example prompts below manually instead.
+
 ### Example Prompts
 
 **Full scan with ranking:**
