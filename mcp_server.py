@@ -2,6 +2,7 @@
 """MCP server for HN Who's Hiring job scanner."""
 
 import json
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -81,25 +82,21 @@ def _scan_hn(months: int, ignore_seen: bool) -> tuple[list[dict], list[dict], li
     return results, filtered_out, thread_titles
 
 
-HN_DESC_LIMIT = 500
-
-
 def _format_hn_results(results: list[dict]) -> list[dict]:
-    """Format HN results for JSON output. Truncates descriptions to HN_DESC_LIMIT chars."""
+    """Format HN results for JSON output with keyword-focused snippets."""
     output = []
     for item in results:
         p = item["parsed"]
-        full_text = p["full_text"]
-        if len(full_text) > HN_DESC_LIMIT:
-            full_text = full_text[:HN_DESC_LIMIT] + "..."
+        keywords = [kw for kws in item["matches"].values() for kw in kws]
+        snippet = _build_keyword_snippet(p["full_text"], keywords)
         output.append({
             "company": p["company"],
             "location": p["location"],
             "remote": p["remote"],
             "score": item["score"],
             "matched_categories": list(item["matches"].keys()),
-            "matched_keywords": [kw for kws in item["matches"].values() for kw in kws],
-            "full_text": full_text,
+            "matched_keywords": keywords,
+            "full_text": snippet,
             "emails": p["emails"],
             "job_board_urls": p["job_board_urls"],
             "other_urls": p["other_urls"],
@@ -109,25 +106,80 @@ def _format_hn_results(results: list[dict]) -> list[dict]:
     return output
 
 
-WAAS_DESC_LIMIT = 500
+DESC_LIMIT = 500
+CONTEXT_WINDOW = 100  # chars before/after each keyword match
+
+
+def _build_keyword_snippet(text: str, keywords: list[str], limit: int = DESC_LIMIT) -> str:
+    """Build a snippet showing text around matched keywords.
+
+    Finds each keyword in the text, extracts surrounding context,
+    merges overlapping regions, and joins with ' ... '. Falls back
+    to the first `limit` chars if no keywords are found in the text.
+    """
+    if len(text) <= limit:
+        return text
+
+    if not keywords:
+        return text[:limit] + "..."
+
+    # Find all keyword positions
+    regions = []
+    for kw in keywords:
+        for m in re.finditer(r"\b" + re.escape(kw) + r"\b", text, re.IGNORECASE):
+            start = max(0, m.start() - CONTEXT_WINDOW)
+            end = min(len(text), m.end() + CONTEXT_WINDOW)
+            regions.append((start, end))
+
+    if not regions:
+        return text[:limit] + "..."
+
+    # Merge overlapping regions
+    regions.sort()
+    merged = [regions[0]]
+    for start, end in regions[1:]:
+        if start <= merged[-1][1] + 20:  # merge if gap < 20 chars
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+
+    # Build snippet from merged regions up to limit
+    parts = []
+    total = 0
+    for start, end in merged:
+        # Extend to word boundaries
+        while start > 0 and text[start - 1] not in " \n\t":
+            start -= 1
+        while end < len(text) and text[end] not in " \n\t":
+            end += 1
+
+        chunk = text[start:end].strip()
+        if total + len(chunk) > limit:
+            remaining = limit - total
+            if remaining > 50:
+                parts.append(chunk[:remaining] + "...")
+            break
+        parts.append(chunk)
+        total += len(chunk)
+
+    return " ... ".join(parts)
 
 
 def _format_waas_results(results: list[dict]) -> list[dict]:
-    """Format WAAS results for JSON output. Truncates descriptions to WAAS_DESC_LIMIT chars."""
+    """Format WAAS results for JSON output with keyword-focused snippets."""
     output = []
     for item in results:
         p = item["parsed"]
-        full_text = p["full_text"]
-        if len(full_text) > WAAS_DESC_LIMIT:
-            full_text = full_text[:WAAS_DESC_LIMIT] + "..."
+        keywords = [kw for kws in item["matches"].values() for kw in kws]
+        snippet = _build_keyword_snippet(p["full_text"], keywords)
         output.append({
             "company": p["company"],
             "location": p["location"],
             "remote": p["remote"],
             "score": item["score"],
             "matched_categories": list(item["matches"].keys()),
-            "matched_keywords": [kw for kws in item["matches"].values() for kw in kws],
-            "full_text": full_text,
+            "matched_keywords": keywords,
+            "full_text": snippet,
             "job_url": p["job_board_urls"][0]["url"] if p["job_board_urls"] else "",
             "job_title": p["job_board_urls"][0]["title"] if p["job_board_urls"] else "",
             "salary_range": p.get("salary_range", ""),
