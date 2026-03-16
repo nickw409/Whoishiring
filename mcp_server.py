@@ -128,16 +128,21 @@ def _format_waas_results(results: list[dict]) -> list[dict]:
 
 @mcp.tool()
 def scan_jobs(months: int = 1, ignore_seen: bool = False) -> str:
-    """Scan HN 'Who is Hiring?' threads for matching job posts.
+    """Scan Hacker News "Who is Hiring?" threads for matching job posts.
 
-    Fetches recent threads, filters by keyword categories (AI tooling,
-    Systems, General AI+SWE), removes non-US non-remote jobs and
-    senior/management roles, scrapes job board links, and returns
-    structured results sorted by keyword score.
+    Searches recent monthly threads, filters by keyword categories
+    (AI tooling, Systems, General AI+SWE), removes non-US non-remote
+    jobs and senior/management roles, scrapes job board links (Greenhouse,
+    Lever, Ashby), and returns structured results sorted by keyword score.
+
+    Each result includes: company, location, remote status, keyword score,
+    matched categories/keywords, full post text, application links/emails,
+    and a direct HN link.
 
     Args:
-        months: Number of monthly threads to scan (1-3). Use 1 for latest only, 3 for backfill.
+        months: Number of monthly threads to scan (1-3). Use 1 for latest, 3 for backfill.
         ignore_seen: If true, return all matching posts even if previously seen.
+                     If false, skip already-seen posts and mark new ones as seen.
     """
     results, filtered_out, thread_titles = _scan_hn(months, ignore_seen)
 
@@ -156,10 +161,31 @@ def scan_jobs(months: int = 1, ignore_seen: bool = False) -> str:
 
 @mcp.tool()
 def scan_waas(ignore_seen: bool = False) -> str:
-    """Scan Work at a Startup (YC's job board) for matching engineering jobs.
+    """Scan Work at a Startup (workatastartup.com) for matching engineering jobs.
 
-    Scrapes workatastartup.com using a headless browser, filters by the
-    same keyword categories as HN scanning, and returns structured results.
+    Authenticates with YC (requires WAAS_USERNAME/WAAS_PASSWORD env vars),
+    then fetches all job listings via the WAAS API. Filters by the same
+    keyword categories as HN scanning. Pre-filters at the API level using
+    Algolia (defaults: role=eng, job_type=fulltime; configurable via
+    config.yaml under the "waas" key).
+
+    Available config.yaml filters under "waas":
+      role: eng|sales|operations|marketing|product
+      eng_type: fs|be|ml|fe|eng_mgmt|devops|embedded
+      remote: yes|only|no
+      job_type: fulltime|intern|contract|cofounder
+      min_experience: 0|1|3|6|11
+      us_visa_required: yes|none|possible
+      has_salary: true|false
+      company_waas_stage: seed|series_a|growth|scale
+
+    Each result includes: company (with YC batch and team size), job title,
+    location, remote status, salary range, keyword score, matched
+    categories/keywords, full job description, skills, and a direct
+    WAAS job link.
+
+    Without credentials, returns 0 results. Set WAAS_USERNAME and
+    WAAS_PASSWORD in the .env file.
 
     Args:
         ignore_seen: If true, return all matching jobs even if previously seen.
@@ -185,10 +211,22 @@ def scan_waas(ignore_seen: bool = False) -> str:
 
 @mcp.tool()
 def scan_all(ignore_seen: bool = False, months: int = 1) -> str:
-    """Scan both HN Who's Hiring and Work at a Startup for matching jobs.
+    """Scan both HN Who's Hiring and Work at a Startup, then combine results.
 
-    Combines results from both sources. If a company appears on both HN and WAAS,
-    only the HN listing is kept (deduplication by company name).
+    Runs both scans in parallel for speed. HN results come from monthly
+    "Who is Hiring?" threads; WAAS results come from YC's job board API
+    (thousands of listings with full descriptions, salary ranges, and skills).
+
+    Cross-source deduplication: if a company appears on both HN and WAAS,
+    only the HN listing is kept. Results from both sources are merged and
+    sorted by keyword score descending.
+
+    Response includes per-source counts (hn_results, waas_results) and
+    any errors that occurred. If one source fails, the other still returns.
+
+    Each result has a "source" field ("hn" or "waas") so you can tell
+    where it came from. WAAS results include extra fields: job_title,
+    salary_range, company_yc_batch, and company_size.
 
     Args:
         ignore_seen: If true, return all jobs even if previously seen.
@@ -263,8 +301,8 @@ def get_resume() -> str:
 def get_preferences() -> str:
     """Get the user's job preferences from config.yaml.
 
-    Returns remote preference and free-form notes about what
-    the user is looking for in a role.
+    Returns remote preference and free-form notes about what the user
+    is looking for. Use alongside get_resume to rank jobs effectively.
     """
     config = hn_jobs.load_config()
     prefs = config["preferences"]
@@ -275,10 +313,10 @@ def get_preferences() -> str:
 
 @mcp.tool()
 def get_latest_results() -> str:
-    """Get the most recent scan results from disk.
+    """Get the most recent scan results from disk without running a new scan.
 
-    Returns the latest results JSON file without running a new scan.
-    Useful for re-ranking or reviewing previous results.
+    Returns the latest results JSON file. Useful for re-ranking or
+    reviewing previous results without waiting for a new scan.
     """
     results_dir = hn_jobs.RESULTS_DIR
     if not results_dir.exists():
@@ -293,12 +331,17 @@ def get_latest_results() -> str:
 
 @mcp.prompt()
 def find_jobs() -> str:
-    """Scan HN and WAAS for jobs and rank them against my resume."""
+    """Find and rank jobs from both HN and YC startups against my resume."""
     return (
         "Use get_resume and get_preferences to understand my background, "
         "then scan_all with ignore_seen=true to find matching positions from "
-        "both HN Who's Hiring and Work at a Startup. "
-        "Rank every job from best to worst fit for me and give me your top 15 with a reason for each."
+        "both HN Who's Hiring and Work at a Startup (YC's job board). "
+        "Rank every job from best to worst fit for me. "
+        "For each of your top 15, include: rank, company name, job title, "
+        "location/remote, salary range (if available from WAAS), YC batch "
+        "(if available), and a 1-2 sentence reason why it's a good fit. "
+        "Group WAAS results separately if they have salary/title info that "
+        "HN results lack."
     )
 
 
@@ -316,10 +359,11 @@ def rerank_results() -> str:
 def scan_overview() -> str:
     """Scan for jobs and give a high-level summary by category."""
     return (
-        "Scan for this month's jobs with scan_jobs using ignore_seen=true. "
+        "Use scan_all with ignore_seen=true to get jobs from both sources. "
         "Don't rank them — just summarize what's out there. "
-        "Group them by category (AI tooling, Systems, General AI+SWE) and "
-        "give me a count and highlights for each."
+        "Group by category (AI tooling, Systems, General AI+SWE) and "
+        "give a count and highlights for each. Note how many came from "
+        "HN vs WAAS. Mention any interesting salary ranges or YC batch trends."
     )
 
 
@@ -329,7 +373,22 @@ def backfill() -> str:
     return (
         "Use scan_all with months=3 and ignore_seen=false to backfill the last 3 months of HN "
         "Who's Hiring threads plus current Work at a Startup jobs. Return a summary of how many "
-        "new jobs were found from each source."
+        "new jobs were found from each source, broken down by category."
+    )
+
+
+@mcp.prompt()
+def waas_only() -> str:
+    """Scan only YC startups and rank against my resume."""
+    return (
+        "Use get_resume and get_preferences to understand my background, "
+        "then scan_waas with ignore_seen=true to find engineering jobs from "
+        "YC startups on Work at a Startup. "
+        "Rank the results by fit. For each of your top 15, include: "
+        "company name, YC batch, job title, salary range, location/remote, "
+        "team size, and a reason why it fits my background. "
+        "WAAS results have rich data — use salary ranges, skills, and "
+        "company descriptions to make better ranking decisions."
     )
 
 
