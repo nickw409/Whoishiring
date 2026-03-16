@@ -6,3 +6,4 @@ config.yaml
 seen_posts.json
 results/
 *.html
+seen_waas.json

@@ -2,6 +2,22 @@
 
 Scans Hacker News monthly "Who is hiring?" threads, filters posts by keyword categories, optionally ranks results against your resume using Claude, and delivers results via HTML email, local file, or Claude Desktop.
 
+## Sources
+
+This scanner pulls from two sources:
+
+### HN Who's Hiring
+- Monthly threads from Hacker News "Ask HN: Who is hiring?"
+- Fetched via Algolia search API
+- Scans current month + configurable history (1-3 months)
+
+### Work at a Startup
+- YC's job board at workatastartup.com
+- Scraped using Playwright headless browser
+- Always scans current live listings
+
+Both sources use identical keyword filtering and scoring. When using `scan_all`, results are deduplicated by company name with HN listings taking priority.
+
 ## Setup
 
 ```bash
@@ -106,6 +122,8 @@ Restart Claude Desktop after adding the config.
 | Tool | Description |
 |------|-------------|
 | `scan_jobs` | Run the full scan pipeline. Args: `months` (1-3), `ignore_seen` (skip dedup) |
+| `scan_waas` | Scan Work at a Startup for matching jobs. Args: `ignore_seen` |
+| `scan_all` | Scan both HN and WAAS, deduplicate by company. Args: `months`, `ignore_seen` |
 | `get_resume` | Extract and return resume text from configured PDF |
 | `get_preferences` | Return job preferences from config.yaml |
 | `get_latest_results` | Return most recent saved results without re-scanning |
@@ -127,6 +145,9 @@ The MCP server registers prompt templates (`find_jobs`, `rerank_results`, `scan_
 
 **Scan multiple months:**
 > Scan the last 3 months of jobs with months=3 and ignore_seen=true. Find anything that's a strong fit for my resume.
+
+**YC startups only:**
+> Use scan_waas with ignore_seen=true to find engineering jobs from YC startups. Get my resume and rank the results by fit.
 
 **Targeted search:**
 > Scan for jobs, get my resume, and find roles that specifically mention Rust or systems programming. Which ones would be the best fit?
@@ -157,4 +178,6 @@ On first run (empty `seen_posts.json`), scans the current month plus 2 prior mon
 - `pyyaml` — config file loading
 - `pymupdf` — PDF resume text extraction
 - `anthropic` — Claude API for CLI ranking
+- `playwright` — headless browser for WAAS scraping
+- `beautifulsoup4` — HTML parsing for WAAS page
 - `mcp` — MCP server for Claude Desktop integration

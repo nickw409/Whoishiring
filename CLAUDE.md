@@ -5,8 +5,8 @@ Python script that scans Hacker News "Who is hiring?" threads, filters posts by 
 
 ## Tech
 - Python 3
-- Dependencies: `requests`, `pyyaml`, `pymupdf`, `anthropic`
-- Single script: `hn_jobs.py`
+- Dependencies: `requests`, `pyyaml`, `pymupdf`, `anthropic`, `playwright`, `beautifulsoup4`
+- Main scripts: `hn_jobs.py`, `waas.py`
 - Config: `config.yaml` (optional, see `config.yaml.example`)
 
 ## Architecture
@@ -68,6 +68,7 @@ Environment variables:
 
 ### Deduplication
 - Track seen HN comment IDs in `seen_posts.json`
+- Track seen WAAS job URLs in `seen_waas.json`
 - Skip already-seen posts on subsequent runs
 - Auto-prune entries older than 6 months
 
@@ -89,7 +90,9 @@ On first run (empty `seen_posts.json`), scan current month + 2 prior months.
 Exposes the scan pipeline to Claude Desktop via the Model Context Protocol (stdio transport). Claude Desktop acts as the ranker, eliminating the need for an API key.
 
 ### Tools
-- `scan_jobs(months=1, ignore_seen=False)` — runs scan pipeline, returns JSON results. `ignore_seen=True` bypasses dedup.
+- `scan_jobs(months=1, ignore_seen=False)` — runs HN scan pipeline, returns JSON results. `ignore_seen=True` bypasses dedup.
+- `scan_waas(ignore_seen=False)` — scrapes Work at a Startup, filters and returns JSON results.
+- `scan_all(months=1, ignore_seen=False)` — combines HN + WAAS, deduplicates by company name (HN priority), sorted by score.
 - `get_resume()` — extracts resume text from configured PDF
 - `get_preferences()` — returns preferences from config.yaml
 - `get_latest_results()` — returns most recent saved results JSON
@@ -97,9 +100,17 @@ Exposes the scan pipeline to Claude Desktop via the Model Context Protocol (stdi
 ### Prompts
 Server registers MCP prompts (`find_jobs`, `rerank_results`, `scan_overview`, `backfill`) but Claude Desktop does not surface them in its UI as of March 2026. They are returned via `prompts/list` but ignored by the client.
 
+### WAAS Integration
+The MCP server exposes Work at a Startup (YC's job board) alongside HN:
+
+- `scan_waas` calls `waas.scan_and_filter_waas()`, returns JSON matching HN format. Browser failures return empty results with error field.
+- `scan_all` combines HN + WAAS in one call. Deduplicates by company name (case-insensitive, stripped). HN takes priority. Results sorted by score descending across sources. Error resilient: if one source fails, returns the other.
+- WAAS uses same keyword categories and scoring as HN (imported from hn_jobs.py)
+- WAAS has separate dedup tracking in `seen_waas.json`
+
 ### Key Details
-- Server imports from `hn_jobs.py` — all pipeline logic lives there, MCP server is just the interface
-- `ignore_seen` skips dedup AND does not update `seen_posts.json` (avoids polluting the seen list)
+- Server imports from `hn_jobs.py` and `waas.py` — pipeline logic lives there, MCP server is just the interface
+- `ignore_seen` skips dedup AND does not update seen files (avoids polluting the seen list)
 - Claude Desktop config uses `wsl` as command on Windows, direct Python path on Linux/Mac
 
 ## Code Style

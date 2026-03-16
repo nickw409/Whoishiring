@@ -3,6 +3,7 @@
 
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 # Add project dir to path so we can import from hn_jobs
@@ -11,29 +12,23 @@ sys.path.insert(0, str(Path(__file__).parent))
 from mcp.server.fastmcp import FastMCP
 
 import hn_jobs
+import waas
 
 mcp = FastMCP(name="HN Who's Hiring")
 
 
-@mcp.tool()
-def scan_jobs(months: int = 1, ignore_seen: bool = False) -> str:
-    """Scan HN 'Who is Hiring?' threads for matching job posts.
+def _scan_hn(months: int, ignore_seen: bool) -> tuple[list[dict], list[dict], list[str]]:
+    """Extract HN scanning logic for reuse in scan_jobs and scan_all.
 
-    Fetches recent threads, filters by keyword categories (AI tooling,
-    Systems, General AI+SWE), removes non-US non-remote jobs and
-    senior/management roles, scrapes job board links, and returns
-    structured results sorted by keyword score.
-
-    Args:
-        months: Number of monthly threads to scan (1-3). Use 1 for latest only, 3 for backfill.
-        ignore_seen: If true, return all matching posts even if previously seen.
+    Returns:
+        (results, filtered_out, thread_titles)
     """
     months = max(1, min(3, months))
 
     seen = hn_jobs.load_seen() if not ignore_seen else {"posts": {}}
     threads = hn_jobs.find_hiring_threads(max_threads=months)
     if not threads:
-        return json.dumps({"error": "No hiring threads found"})
+        return [], [], []
 
     thread_titles = [t.get("title", "Unknown") for t in threads]
 
@@ -78,23 +73,20 @@ def scan_jobs(months: int = 1, ignore_seen: bool = False) -> str:
 
     results.sort(key=lambda x: x["score"], reverse=True)
 
-    # Update dedup (skip if ignore_seen to avoid polluting the seen list)
     if not ignore_seen:
         hn_jobs.mark_seen(seen, all_seen_ids)
         hn_jobs.prune_seen(seen)
         hn_jobs.save_seen(seen)
 
-    # Format output for Claude
-    output = {
-        "threads": thread_titles,
-        "total_results": len(results),
-        "total_filtered": len(filtered_out),
-        "results": [],
-    }
+    return results, filtered_out, thread_titles
 
+
+def _format_hn_results(results: list[dict]) -> list[dict]:
+    """Format HN results for JSON output."""
+    output = []
     for item in results:
         p = item["parsed"]
-        output["results"].append({
+        output.append({
             "company": p["company"],
             "location": p["location"],
             "remote": p["remote"],
@@ -106,9 +98,142 @@ def scan_jobs(months: int = 1, ignore_seen: bool = False) -> str:
             "job_board_urls": p["job_board_urls"],
             "other_urls": p["other_urls"],
             "hn_link": f"https://news.ycombinator.com/item?id={p['id']}",
+            "source": "hn",
         })
+    return output
+
+
+def _format_waas_results(results: list[dict]) -> list[dict]:
+    """Format WAAS results for JSON output."""
+    output = []
+    for item in results:
+        p = item["parsed"]
+        output.append({
+            "company": p["company"],
+            "location": p["location"],
+            "remote": p["remote"],
+            "score": item["score"],
+            "matched_categories": list(item["matches"].keys()),
+            "matched_keywords": [kw for kws in item["matches"].values() for kw in kws],
+            "full_text": p["full_text"],
+            "job_url": p["job_board_urls"][0]["url"] if p["job_board_urls"] else "",
+            "job_title": p["job_board_urls"][0]["title"] if p["job_board_urls"] else "",
+            "salary_range": p.get("salary_range", ""),
+            "company_yc_batch": p.get("company_yc_batch", ""),
+            "company_size": p.get("company_size", ""),
+            "source": "waas",
+        })
+    return output
+
+
+@mcp.tool()
+def scan_jobs(months: int = 1, ignore_seen: bool = False) -> str:
+    """Scan HN 'Who is Hiring?' threads for matching job posts.
+
+    Fetches recent threads, filters by keyword categories (AI tooling,
+    Systems, General AI+SWE), removes non-US non-remote jobs and
+    senior/management roles, scrapes job board links, and returns
+    structured results sorted by keyword score.
+
+    Args:
+        months: Number of monthly threads to scan (1-3). Use 1 for latest only, 3 for backfill.
+        ignore_seen: If true, return all matching posts even if previously seen.
+    """
+    results, filtered_out, thread_titles = _scan_hn(months, ignore_seen)
+
+    if not thread_titles:
+        return json.dumps({"error": "No hiring threads found"})
+
+    output = {
+        "threads": thread_titles,
+        "total_results": len(results),
+        "total_filtered": len(filtered_out),
+        "results": _format_hn_results(results),
+    }
 
     return json.dumps(output, indent=2)
+
+
+@mcp.tool()
+def scan_waas(ignore_seen: bool = False) -> str:
+    """Scan Work at a Startup (YC's job board) for matching engineering jobs.
+
+    Scrapes workatastartup.com using a headless browser, filters by the
+    same keyword categories as HN scanning, and returns structured results.
+
+    Args:
+        ignore_seen: If true, return all matching jobs even if previously seen.
+    """
+    try:
+        results, filtered_out = waas.scan_and_filter_waas(ignore_seen=ignore_seen)
+    except Exception as e:
+        return json.dumps({
+            "source": "waas",
+            "total_results": 0,
+            "total_filtered": 0,
+            "results": [],
+            "error": str(e),
+        }, indent=2)
+
+    return json.dumps({
+        "source": "waas",
+        "total_results": len(results),
+        "total_filtered": len(filtered_out),
+        "results": _format_waas_results(results),
+    }, indent=2)
+
+
+@mcp.tool()
+def scan_all(ignore_seen: bool = False, months: int = 1) -> str:
+    """Scan both HN Who's Hiring and Work at a Startup for matching jobs.
+
+    Combines results from both sources. If a company appears on both HN and WAAS,
+    only the HN listing is kept (deduplication by company name).
+
+    Args:
+        ignore_seen: If true, return all jobs even if previously seen.
+        months: Number of HN monthly threads to scan (1-3).
+    """
+    # Pass 1: scrape both sources in parallel
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        hn_future = pool.submit(_scan_hn, months, ignore_seen)
+        waas_future = pool.submit(waas.scrape_waas_jobs, ignore_seen=ignore_seen)
+
+        try:
+            hn_results, hn_filtered, thread_titles = hn_future.result()
+        except Exception:
+            hn_results, hn_filtered, thread_titles = [], [], []
+
+        try:
+            waas_raw = waas_future.result()
+        except Exception:
+            waas_raw = []
+
+    # Pass 2: dedup WAAS against HN companies, then filter
+    hn_company_names = set()
+    for item in hn_results:
+        company = item["parsed"].get("company")
+        if company:
+            hn_company_names.add(company.lower().strip())
+
+    try:
+        waas_results, waas_filtered = waas.filter_waas_jobs(waas_raw, hn_company_names=hn_company_names)
+    except Exception:
+        waas_results, waas_filtered = [], []
+
+    # Combine and sort by score descending
+    combined = _format_hn_results(hn_results) + _format_waas_results(waas_results)
+    combined.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+    return json.dumps({
+        "sources": ["hn", "waas"],
+        "threads": thread_titles,
+        "total_results": len(combined),
+        "total_filtered": len(hn_filtered) + len(waas_filtered),
+        "hn_results": len(hn_results),
+        "waas_results": len(waas_results),
+        "results": combined,
+    }, indent=2)
 
 
 @mcp.tool()
@@ -158,10 +283,11 @@ def get_latest_results() -> str:
 
 @mcp.prompt()
 def find_jobs() -> str:
-    """Scan this month's HN jobs and rank them against my resume."""
+    """Scan HN and WAAS for jobs and rank them against my resume."""
     return (
         "Use get_resume and get_preferences to understand my background, "
-        "then scan_jobs with ignore_seen=true to find this month's matching positions. "
+        "then scan_all with ignore_seen=true to find matching positions from "
+        "both HN Who's Hiring and Work at a Startup. "
         "Rank every job from best to worst fit for me and give me your top 15 with a reason for each."
     )
 
@@ -189,11 +315,11 @@ def scan_overview() -> str:
 
 @mcp.prompt()
 def backfill() -> str:
-    """Scan the last 3 months and find the best matches."""
+    """Backfill last 3 months of HN and current WAAS jobs."""
     return (
-        "Use get_resume and get_preferences to understand my background, "
-        "then scan_jobs with months=3 and ignore_seen=true to get the last 3 months of jobs. "
-        "Rank every job from best to worst fit and give me your top 20 with a reason for each."
+        "Use scan_all with months=3 and ignore_seen=false to backfill the last 3 months of HN "
+        "Who's Hiring threads plus current Work at a Startup jobs. Return a summary of how many "
+        "new jobs were found from each source."
     )
 
 
