@@ -7,3 +7,6 @@ seen_posts.json
 results/
 *.html
 seen_waas.json
+.vex/report.json
+.vex/validation.json
+.vex/drift.json

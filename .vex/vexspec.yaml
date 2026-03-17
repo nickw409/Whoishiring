@@ -1,0 +1,200 @@
+project: Whoishiring
+description: ""
+sections:
+    - name: Thread Discovery
+      file: hn_jobs.py
+      path: tests/
+      description: |
+        Finds HN "Who is hiring?" threads via Algolia search API and fetches their top-level comments.
+      behaviors:
+        - name: find-hiring-threads
+          description: |
+            Searches Algolia API for "Ask HN: Who is hiring?" threads and returns up to max_threads results ordered by date. On first run (empty seen_posts.json), fetches 3 months of threads. On subsequent runs, fetches only the latest thread.
+        - name: fetch-comments-parallel
+          description: |
+            Fetches all top-level comments from a hiring thread using 20 parallel workers via the Firebase HN API. Returns comment objects with HTML text and metadata. Retries failed requests up to 3 times.
+        - name: first-run-backfill
+          description: |
+            When seen_posts.json is empty (first run), scans current month plus 2 prior months of hiring threads. Subsequent runs scan only the most recent thread.
+    - name: Keyword Matching and Scoring
+      path: tests/
+      file:
+        - hn_jobs.py
+        - waas.py
+      description: |
+        Matches job post text against keyword categories and computes relevance scores.
+      behaviors:
+        - name: category-keyword-matching
+          description: |
+            Matches post text against three keyword categories using word-boundary case-insensitive regex: AI tooling (weight 3, keywords like "claude code", "copilot", "cursor", "llm"), Systems (weight 2, keywords like "rust", "cuda", "gpu"), General AI+SWE (weight 1, keywords like "machine learning", "pytorch"). Returns matched categories with their specific keyword hits.
+        - name: per-category-scoring
+          description: |
+            Scores posts by summing the weight of each matched category exactly once, regardless of how many keywords matched within that category. A post matching "claude code" and "copilot" (both AI tooling) scores 3, not 6. A post matching AI tooling + Systems scores 5.
+        - name: waas-weighted-scoring
+          description: |
+            For WAAS jobs, scores keywords by where they appear in the job description: title (3.0x), requirements section (2.0x), general description (1.0x), nice-to-have section (0.5x), tags (0.3x). Multiplies location weight by category weight for each matched keyword and sums the result.
+    - name: Filtering
+      path: tests/
+      file: hn_jobs.py
+      description: |
+        Filters posts by negative keywords (seniority/management) and location (non-US, non-remote).
+      behaviors:
+        - name: negative-keyword-filter
+          description: |
+            Matches posts against negative keywords ("staff engineer", "principal engineer", "engineering manager", "director of", "vp of", "10+ years", "15+ years") using word-boundary case-insensitive regex. Posts matching both positive and negative keywords are placed in a "Filtered Out" section (not silently dropped). Posts matching only negative keywords with no positive matches are discarded entirely.
+        - name: location-filter
+          description: |
+            Filters out non-US, non-remote jobs. Remote jobs always pass. Jobs with no detected location pass (benefit of the doubt). Jobs matching US city/state patterns pass. Jobs matching non-US city/country patterns are filtered out and placed in the "Filtered Out" section with reason "non-US location".
+    - name: Comment Parsing
+      path: tests/
+      file: hn_jobs.py
+      description: |
+        Parses HN comment HTML into structured job post data.
+      behaviors:
+        - name: parse-company-location-remote
+          description: |
+            Extracts company name, location, and remote status from the pipe-delimited header line of HN comments. Produces a structured record with these fields plus a text snippet.
+        - name: extract-emails-and-instructions
+          description: |
+            Extracts email addresses from post text and captures surrounding application instructions (±120 characters around each email) for context on how to apply.
+        - name: extract-and-classify-urls
+          description: |
+            Extracts URLs from both href attributes and plain text in comment HTML. Classifies each URL by domain: "greenhouse" (greenhouse.io), "lever" (lever.co), "ashby" (ashbyhq.com), or "other". Job board URLs are stored separately from other URLs.
+        - name: strip-html
+          description: |
+            Removes HN HTML formatting tags (<p>, <br>) and decodes HTML entities to produce clean plain text from comment HTML.
+    - name: Job Board Scraping
+      path: tests/
+      file: hn_jobs.py
+      description: |
+        Scrapes job titles from Greenhouse, Lever, and Ashby job board URLs.
+      behaviors:
+        - name: scrape-job-title
+          description: |
+            Extracts job title from a job board URL using a cascade of strategies: JSON-LD structured data first, then Open Graph meta tags, then meta title tag, then HTML <title> tag as fallback. Returns the first successfully extracted title.
+        - name: politeness-delay
+          description: |
+            Waits 0.5 seconds between consecutive job board scrape requests to avoid rate limiting. Sends a descriptive User-Agent header with requests.
+    - name: Deduplication
+      path: tests/
+      file:
+        - hn_jobs.py
+        - waas.py
+      description: |
+        Tracks seen posts/jobs across runs to avoid showing duplicates.
+      behaviors:
+        - name: hn-dedup-tracking
+          description: |
+            Stores seen HN comment IDs with timestamps in seen_posts.json. On subsequent runs, skips any previously seen comment IDs. New comment IDs are marked with current timestamp after processing.
+        - name: waas-dedup-tracking
+          description: |
+            Stores seen WAAS job URLs with timestamps in seen_waas.json. On subsequent runs, skips any previously seen job URLs. New job URLs are marked with current timestamp after processing.
+        - name: auto-prune
+          description: |
+            Automatically removes entries older than 180 days from both seen_posts.json and seen_waas.json when loading the dedup files.
+        - name: ignore-seen-mode
+          description: |
+            When ignore_seen is true, bypasses dedup filtering and does not update the seen files, avoiding pollution of the seen list during exploratory scans.
+    - name: Claude Ranking
+      path: tests/
+      file: hn_jobs.py
+      description: |
+        Optionally ranks filtered results against a resume using Claude API.
+      behaviors:
+        - name: rank-jobs-against-resume
+          description: |
+            When a resume PDF path is configured, ANTHROPIC_API_KEY is set, and --no-rank is not passed, sends all filtered results plus extracted resume text plus user preferences to Claude in one API call. Claude returns a JSON array ranking every job by fit with a per-job reason. Results are reordered by Claude's ranking with rank badges (#1, #2, etc.) and reasoning added to each result.
+        - name: ranking-fallback
+          description: |
+            Falls back to score-based ordering when any ranking prerequisite is missing (no resume, no API key, --no-rank flag) or when the Claude API call fails for any reason. Emits a warning but does not crash.
+        - name: extract-resume-text
+          description: |
+            Extracts plain text from a PDF resume file using pymupdf for inclusion in the Claude ranking prompt.
+    - name: Output
+      path: tests/
+      file: hn_jobs.py
+      description: |
+        Formats and delivers results via email, HTML file, terminal, or JSON.
+      behaviors:
+        - name: html-email-delivery
+          description: |
+            Builds a complete HTML email with inline styles containing: header with HN logo and thread titles, result cards sorted by score or Claude rank, a separate "Filtered Out" section for negatively-filtered posts. Sends via Gmail SMTP SSL on port 465 using configured credentials. Subject line includes current month and year.
+        - name: dry-run-html-preview
+          description: |
+            With --dry-run flag, saves the HTML output to results/preview_<timestamp>.html instead of sending email.
+        - name: terminal-output
+          description: |
+            With --no-email flag, prints results to terminal with formatting including company, location, score, matched keywords, and application links.
+        - name: json-results-save
+          description: |
+            Always saves structured JSON results to results/results_<timestamp>.json containing scan time, thread titles, full result objects (id, company, location, remote, score, matched categories/keywords, job board URLs, emails), and filtered out count.
+        - name: keyword-highlighting
+          description: |
+            In HTML output, wraps matched keywords in the post snippet with highlighted markup so they are visually distinct.
+        - name: rank-badge-display
+          description: |
+            When Claude ranking is active, HTML output shows rank badges (#1, #2, etc.) and per-job reasoning text on each result card.
+    - name: WAAS Scraper
+      path: tests/
+      file: waas.py
+      description: |
+        Scrapes Work at a Startup (YC's job board) using Playwright browser automation and Algolia API.
+      behaviors:
+        - name: yc-login
+          description: |
+            Authenticates to YC account using WAAS_USERNAME and WAAS_PASSWORD environment variables via Playwright browser automation. Navigates to the auth page, fills credentials, clicks login, and detects login failure if still on auth page after redirect wait.
+        - name: algolia-job-fetch
+          description: |
+            After login, extracts the Algolia API key from the page via JavaScript, then fetches company IDs by paginating through Algolia search results (100 per page) with filters built from config.yaml WAAS settings (role, eng_type, remote, job_type, min_experience, etc.).
+        - name: batch-company-fetch
+          description: |
+            Fetches full company data in batches of 10 by POSTing to /companies/fetch with a CSRF token extracted from the page DOM. Includes a 0.3s delay between batches. Flattens company data into individual job records with title, URL, location, remote status, salary, skills, and detail string.
+        - name: waas-keyword-filter
+          description: |
+            Applies the same keyword matching, negative keyword filtering, and location filtering as HN posts. Produces results and filtered_out lists in the same format as HN for unified output.
+        - name: cross-source-dedup
+          description: |
+            When combining HN and WAAS results, deduplicates by company name (case-insensitive, whitespace-stripped). HN results take priority over WAAS results for the same company.
+        - name: subprocess-fallback
+          description: |
+            When running inside an existing asyncio event loop (e.g., Claude Desktop MCP server), runs the Playwright scraper in a subprocess to avoid event loop conflicts. Captures JSON output via stdout with a 300-second timeout. Without YC credentials, returns limited results (~30 jobs).
+        - name: waas-config-filters
+          description: |
+            Builds Algolia filter strings from config.yaml WAAS settings. Supports comma-separated values for OR logic (e.g., min_experience "0,1" becomes "(min_experience:0 OR min_experience:1)"). Supported filters: role, eng_type, remote, job_type, min_experience, us_visa_required, has_salary, company_waas_stage.
+    - name: MCP Server
+      path: tests/
+      file: mcp_server.py
+      description: |
+        Exposes the scan pipeline as MCP tools for Claude Desktop via stdio transport.
+      behaviors:
+        - name: scan-jobs-tool
+          description: |
+            The scan_jobs tool runs the HN scan pipeline with configurable months parameter (default 1) and ignore_seen flag (default false). Returns JSON results in the same format as the CLI. When ignore_seen is true, bypasses dedup and does not update seen files.
+        - name: scan-waas-tool
+          description: |
+            The scan_waas tool runs the WAAS scraper with optional ignore_seen flag. Returns JSON results matching the HN format. Returns empty results with an error field if browser automation fails.
+        - name: scan-all-tool
+          description: |
+            The scan_all tool combines HN and WAAS results in one call. Deduplicates by company name (case-insensitive, stripped) with HN taking priority. Sorts combined results by score descending. If one source fails, returns results from the other source (error resilient).
+        - name: get-resume-tool
+          description: |
+            The get_resume tool extracts and returns plain text from the configured PDF resume path in config.yaml.
+        - name: get-preferences-tool
+          description: |
+            The get_preferences tool returns the preferences section from config.yaml including remote preference and free-form notes.
+        - name: get-latest-results-tool
+          description: |
+            The get_latest_results tool returns the most recently saved JSON results file from the results directory.
+    - name: Configuration
+      path: tests/
+      file:
+        - hn_jobs.py
+        - mcp_server.py
+      description: |
+        Loads configuration from config.yaml and environment variables.
+      behaviors:
+        - name: load-config
+          description: |
+            Loads config.yaml (optional file) and returns resume text (extracted from configured PDF path) and preferences object. The --resume CLI flag overrides the config file resume path. Returns None for resume_text if no resume is configured.
+        - name: environment-variables
+          description: Reads ANTHROPIC_API_KEY for Claude ranking, HN_JOBS_EMAIL_TO/FROM/PASSWORD for email delivery, and WAAS_USERNAME/WAAS_PASSWORD for YC authentication. Missing email credentials cause sys.exit(1) when email mode is active; --no-email and --dry-run bypass the check entirely. Missing API key skips Claude ranking with a warning. Missing WAAS credentials return empty results from the API scraper.
