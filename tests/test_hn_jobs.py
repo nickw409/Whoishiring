@@ -10,6 +10,25 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock, call
 
 import hn_jobs
+from filters import SeenTracker
+
+
+def _mock_tracker_class(entries=None):
+    """Create a mock SeenTracker class that returns a tracker with given entries."""
+    class MockSeenTracker:
+        def __init__(self, *args, **kwargs):
+            self.entries = dict(entries) if entries else {}
+            self._saved = False
+        def load(self): return self
+        def save(self): self._saved = True
+        def prune(self): pass
+        def is_seen(self, id_): return str(id_) in self.entries
+        def mark(self, ids):
+            now = time.time()
+            for id_ in ids:
+                self.entries[str(id_)] = now
+        def is_empty(self): return len(self.entries) == 0
+    return MockSeenTracker
 
 
 # ---------------------------------------------------------------------------
@@ -187,13 +206,17 @@ class TestFetchComments:
 
 class TestFirstRunBackfill:
     def test_is_first_run_empty_seen(self):
-        assert hn_jobs.is_first_run({"posts": {}}) is True
+        tracker = SeenTracker("/dev/null", "posts")
+        assert tracker.is_empty() is True
 
     def test_is_not_first_run(self):
-        assert hn_jobs.is_first_run({"posts": {"123": 1234567890}}) is False
+        tracker = SeenTracker("/dev/null", "posts")
+        tracker.mark(["123"])
+        assert tracker.is_empty() is False
 
     def test_is_first_run_missing_posts_key(self):
-        assert hn_jobs.is_first_run({}) is True
+        tracker = SeenTracker("/dev/null", "posts")
+        assert tracker.is_empty() is True
 
 
 # ---------------------------------------------------------------------------
@@ -542,54 +565,57 @@ class TestScrapeJobBoards:
 # ---------------------------------------------------------------------------
 
 class TestHnDedup:
-    def test_load_seen_empty(self, tmp_path):
-        with patch.object(hn_jobs, "SEEN_FILE", tmp_path / "seen.json"):
-            seen = hn_jobs.load_seen()
-        assert seen == {"posts": {}}
+    def test_load_empty(self, tmp_path):
+        tracker = SeenTracker(tmp_path / "seen.json", "posts")
+        tracker.load()
+        assert tracker.entries == {}
 
-    def test_load_seen_existing(self, tmp_path):
+    def test_load_existing(self, tmp_path):
         f = tmp_path / "seen.json"
         f.write_text(json.dumps({"posts": {"123": 1234567890.0}}))
-        with patch.object(hn_jobs, "SEEN_FILE", f):
-            seen = hn_jobs.load_seen()
-        assert "123" in seen["posts"]
+        tracker = SeenTracker(f, "posts")
+        tracker.load()
+        assert "123" in tracker.entries
 
-    def test_load_seen_corrupt_json(self, tmp_path):
+    def test_load_corrupt_json(self, tmp_path):
         f = tmp_path / "seen.json"
         f.write_text("not json{{{")
-        with patch.object(hn_jobs, "SEEN_FILE", f):
-            seen = hn_jobs.load_seen()
-        assert seen == {"posts": {}}
+        tracker = SeenTracker(f, "posts")
+        tracker.load()
+        assert tracker.entries == {}
 
-    def test_save_seen(self, tmp_path):
+    def test_save(self, tmp_path):
         f = tmp_path / "seen.json"
-        with patch.object(hn_jobs, "SEEN_FILE", f):
-            hn_jobs.save_seen({"posts": {"456": 9999999.0}})
+        tracker = SeenTracker(f, "posts")
+        tracker.mark(["456"])
+        tracker.save()
         data = json.loads(f.read_text())
         assert "456" in data["posts"]
 
-    def test_mark_seen(self):
-        seen = {"posts": {}}
-        with patch("hn_jobs.time.time", return_value=1000.0):
-            result = hn_jobs.mark_seen(seen, [100, 200])
-        assert "100" in result["posts"]
-        assert "200" in result["posts"]
-        assert result["posts"]["100"] == 1000.0
+    def test_mark(self):
+        tracker = SeenTracker("/dev/null", "posts")
+        with patch("filters.time.time", return_value=1000.0):
+            tracker.mark(["100", "200"])
+        assert "100" in tracker.entries
+        assert "200" in tracker.entries
+        assert tracker.entries["100"] == 1000.0
 
-    def test_prune_seen_removes_old(self):
+    def test_prune_removes_old(self):
         now = time.time()
-        old = now - (200 * 86400)  # 200 days ago
-        recent = now - (10 * 86400)  # 10 days ago
-        seen = {"posts": {"old": old, "recent": recent}}
-        result = hn_jobs.prune_seen(seen)
-        assert "old" not in result["posts"]
-        assert "recent" in result["posts"]
+        old = now - (200 * 86400)
+        recent = now - (10 * 86400)
+        tracker = SeenTracker("/dev/null", "posts")
+        tracker._data["posts"] = {"old": old, "recent": recent}
+        tracker.prune()
+        assert "old" not in tracker.entries
+        assert "recent" in tracker.entries
 
-    def test_prune_seen_keeps_all_recent(self):
+    def test_prune_keeps_all_recent(self):
         now = time.time()
-        seen = {"posts": {"a": now, "b": now - 86400}}
-        result = hn_jobs.prune_seen(seen)
-        assert len(result["posts"]) == 2
+        tracker = SeenTracker("/dev/null", "posts")
+        tracker._data["posts"] = {"a": now, "b": now - 86400}
+        tracker.prune()
+        assert len(tracker.entries) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -843,12 +869,11 @@ class TestPrintResults:
 class TestDryRunAndJsonSave:
     def test_dry_run_saves_html(self, tmp_path):
         with patch.object(hn_jobs, "RESULTS_DIR", tmp_path), \
-             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}}), \
-             patch("hn_jobs.load_seen", return_value={"posts": {"1": 999}}), \
+             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}, "filters": {"max_seniority": None, "coding_only": False}}), \
+             patch("hn_jobs.SeenTracker", _mock_tracker_class({"1": 999})), \
              patch("hn_jobs.find_hiring_threads", return_value=[{"title": "T", "kids": [10]}]), \
              patch("hn_jobs.fetch_comments", return_value=[{"id": 10, "text": "Acme | SF | LLM engineer needed", "time": 0}]), \
              patch("hn_jobs.scrape_job_boards"), \
-             patch("hn_jobs.save_seen"), \
              patch("sys.argv", ["hn_jobs.py", "--dry-run"]):
             hn_jobs.main()
 
@@ -870,7 +895,7 @@ class TestDryRunAndJsonSave:
 class TestEnvironmentVariables:
     def test_missing_email_creds_exits(self):
         with patch.dict(os.environ, {}, clear=True), \
-             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}}), \
+             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}, "filters": {"max_seniority": None, "coding_only": False}}), \
              patch("sys.argv", ["hn_jobs.py"]), \
              pytest.raises(SystemExit):
             # Remove email env vars
@@ -889,7 +914,7 @@ class TestFirstRunBackfillIntegration:
         with patch.object(hn_jobs, "RESULTS_DIR", tmp_path), \
              patch.object(hn_jobs, "SEEN_FILE", tmp_path / "seen.json"), \
              patch("hn_jobs.find_hiring_threads", return_value=[]) as mock_find, \
-             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}}), \
+             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}, "filters": {"max_seniority": None, "coding_only": False}}), \
              patch("sys.argv", ["hn_jobs.py", "--dry-run"]), \
              pytest.raises(SystemExit):
             hn_jobs.main()
@@ -903,7 +928,7 @@ class TestFirstRunBackfillIntegration:
         with patch.object(hn_jobs, "RESULTS_DIR", tmp_path), \
              patch.object(hn_jobs, "SEEN_FILE", seen_file), \
              patch("hn_jobs.find_hiring_threads", return_value=[]) as mock_find, \
-             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}}), \
+             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}, "filters": {"max_seniority": None, "coding_only": False}}), \
              patch("sys.argv", ["hn_jobs.py", "--dry-run"]), \
              pytest.raises(SystemExit):
             hn_jobs.main()
@@ -920,12 +945,11 @@ class TestNegativeFilterIntegration:
         # Post matches LLM (positive) and "staff engineer" (negative)
         comment = {"id": 50, "text": "Acme | SF | LLM staff engineer position", "time": 0}
         with patch.object(hn_jobs, "RESULTS_DIR", tmp_path), \
-             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}}), \
-             patch("hn_jobs.load_seen", return_value={"posts": {}}), \
+             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}, "filters": {"max_seniority": None, "coding_only": False}}), \
+             patch("hn_jobs.SeenTracker", _mock_tracker_class()), \
              patch("hn_jobs.find_hiring_threads", return_value=[{"title": "T", "kids": [50]}]), \
              patch("hn_jobs.fetch_comments", return_value=[comment]), \
              patch("hn_jobs.scrape_job_boards"), \
-             patch("hn_jobs.save_seen"), \
              patch("sys.argv", ["hn_jobs.py", "--dry-run"]):
             hn_jobs.main()
 
@@ -938,12 +962,11 @@ class TestNegativeFilterIntegration:
         # Post matches only "staff engineer" (negative), no positive keywords
         comment = {"id": 60, "text": "Acme | SF | Staff Engineer role no AI here", "time": 0}
         with patch.object(hn_jobs, "RESULTS_DIR", tmp_path), \
-             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}}), \
-             patch("hn_jobs.load_seen", return_value={"posts": {}}), \
+             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}, "filters": {"max_seniority": None, "coding_only": False}}), \
+             patch("hn_jobs.SeenTracker", _mock_tracker_class()), \
              patch("hn_jobs.find_hiring_threads", return_value=[{"title": "T", "kids": [60]}]), \
              patch("hn_jobs.fetch_comments", return_value=[comment]), \
              patch("hn_jobs.scrape_job_boards"), \
-             patch("hn_jobs.save_seen"), \
              patch("sys.argv", ["hn_jobs.py", "--dry-run"]):
             hn_jobs.main()
 
@@ -1034,12 +1057,11 @@ class TestHnDedupIntegration:
     def test_seen_comment_skipped(self, tmp_path):
         comment = {"id": 77, "text": "Acme | SF | LLM engineer needed", "time": 0}
         with patch.object(hn_jobs, "RESULTS_DIR", tmp_path), \
-             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}}), \
-             patch("hn_jobs.load_seen", return_value={"posts": {"77": time.time()}}), \
+             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}, "filters": {"max_seniority": None, "coding_only": False}}), \
+             patch("hn_jobs.SeenTracker", _mock_tracker_class({"77": time.time()})), \
              patch("hn_jobs.find_hiring_threads", return_value=[{"title": "T", "kids": [77]}]), \
              patch("hn_jobs.fetch_comments", return_value=[comment]), \
              patch("hn_jobs.scrape_job_boards"), \
-             patch("hn_jobs.save_seen"), \
              patch("sys.argv", ["hn_jobs.py", "--dry-run"]):
             hn_jobs.main()
 
@@ -1112,12 +1134,11 @@ class TestJsonResultsSaveAdditional:
     def test_result_fields_complete(self, tmp_path):
         comment = {"id": 88, "text": "Acme | San Francisco, CA | LLM engineer needed", "time": 0}
         with patch.object(hn_jobs, "RESULTS_DIR", tmp_path), \
-             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}}), \
-             patch("hn_jobs.load_seen", return_value={"posts": {}}), \
+             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}, "filters": {"max_seniority": None, "coding_only": False}}), \
+             patch("hn_jobs.SeenTracker", _mock_tracker_class()), \
              patch("hn_jobs.find_hiring_threads", return_value=[{"title": "T", "kids": [88]}]), \
              patch("hn_jobs.fetch_comments", return_value=[comment]), \
              patch("hn_jobs.scrape_job_boards"), \
-             patch("hn_jobs.save_seen"), \
              patch("sys.argv", ["hn_jobs.py", "--dry-run"]):
             hn_jobs.main()
 
@@ -1133,12 +1154,11 @@ class TestJsonResultsSaveAdditional:
     def test_json_saved_with_no_email_mode(self, tmp_path):
         comment = {"id": 89, "text": "Acme | SF | LLM engineer", "time": 0}
         with patch.object(hn_jobs, "RESULTS_DIR", tmp_path), \
-             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}}), \
-             patch("hn_jobs.load_seen", return_value={"posts": {}}), \
+             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}, "filters": {"max_seniority": None, "coding_only": False}}), \
+             patch("hn_jobs.SeenTracker", _mock_tracker_class()), \
              patch("hn_jobs.find_hiring_threads", return_value=[{"title": "T", "kids": [89]}]), \
              patch("hn_jobs.fetch_comments", return_value=[comment]), \
              patch("hn_jobs.scrape_job_boards"), \
-             patch("hn_jobs.save_seen"), \
              patch("sys.argv", ["hn_jobs.py", "--no-email"]):
             hn_jobs.main()
 
@@ -1200,12 +1220,11 @@ class TestHtmlEmailStructure:
         """Verify main() builds HTML and sends via SMTP when not dry-run."""
         comment = {"id": 99, "text": "Acme | SF | LLM engineer needed", "time": 0}
         with patch.object(hn_jobs, "RESULTS_DIR", tmp_path), \
-             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}}), \
-             patch("hn_jobs.load_seen", return_value={"posts": {}}), \
+             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}, "filters": {"max_seniority": None, "coding_only": False}}), \
+             patch("hn_jobs.SeenTracker", _mock_tracker_class()), \
              patch("hn_jobs.find_hiring_threads", return_value=[{"title": "T", "kids": [99]}]), \
              patch("hn_jobs.fetch_comments", return_value=[comment]), \
              patch("hn_jobs.scrape_job_boards"), \
-             patch("hn_jobs.save_seen"), \
              patch("hn_jobs.send_email") as mock_send, \
              patch.dict(os.environ, {
                  "HN_JOBS_EMAIL_TO": "to@x.com",
@@ -1246,18 +1265,20 @@ class TestScoreMatchesAdditional:
 class TestAutoPruneInMain:
     def test_prune_called_during_main(self, tmp_path):
         comment = {"id": 101, "text": "Acme | SF | LLM engineer", "time": 0}
+        mock_tracker = MagicMock()
+        mock_tracker.is_empty.return_value = True
+        mock_tracker.is_seen.return_value = False
+        MockTrackerClass = MagicMock(return_value=mock_tracker)
         with patch.object(hn_jobs, "RESULTS_DIR", tmp_path), \
-             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}}), \
-             patch("hn_jobs.load_seen", return_value={"posts": {}}), \
+             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}, "filters": {"max_seniority": None, "coding_only": False}}), \
+             patch("hn_jobs.SeenTracker", MockTrackerClass), \
              patch("hn_jobs.find_hiring_threads", return_value=[{"title": "T", "kids": [101]}]), \
              patch("hn_jobs.fetch_comments", return_value=[comment]), \
              patch("hn_jobs.scrape_job_boards"), \
-             patch("hn_jobs.save_seen"), \
-             patch("hn_jobs.prune_seen") as mock_prune, \
              patch("sys.argv", ["hn_jobs.py", "--dry-run"]):
             hn_jobs.main()
 
-        mock_prune.assert_called_once()
+        mock_tracker.prune.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1268,12 +1289,11 @@ class TestRankingFallbackIntegration:
     def test_no_rank_flag_skips_ranking(self, tmp_path):
         comment = {"id": 102, "text": "Acme | SF | LLM engineer needed", "time": 0}
         with patch.object(hn_jobs, "RESULTS_DIR", tmp_path), \
-             patch("hn_jobs.load_config", return_value={"resume_text": "resume", "preferences": {}}), \
-             patch("hn_jobs.load_seen", return_value={"posts": {}}), \
+             patch("hn_jobs.load_config", return_value={"resume_text": "resume", "preferences": {}, "filters": {"max_seniority": None, "coding_only": False}}), \
+             patch("hn_jobs.SeenTracker", _mock_tracker_class()), \
              patch("hn_jobs.find_hiring_threads", return_value=[{"title": "T", "kids": [102]}]), \
              patch("hn_jobs.fetch_comments", return_value=[comment]), \
              patch("hn_jobs.scrape_job_boards"), \
-             patch("hn_jobs.save_seen"), \
              patch("hn_jobs.rank_jobs_with_claude") as mock_rank, \
              patch("sys.argv", ["hn_jobs.py", "--dry-run", "--no-rank"]):
             hn_jobs.main()
@@ -1283,12 +1303,11 @@ class TestRankingFallbackIntegration:
     def test_missing_resume_skips_ranking(self, tmp_path):
         comment = {"id": 103, "text": "Acme | SF | LLM engineer needed", "time": 0}
         with patch.object(hn_jobs, "RESULTS_DIR", tmp_path), \
-             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}}), \
-             patch("hn_jobs.load_seen", return_value={"posts": {}}), \
+             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}, "filters": {"max_seniority": None, "coding_only": False}}), \
+             patch("hn_jobs.SeenTracker", _mock_tracker_class()), \
              patch("hn_jobs.find_hiring_threads", return_value=[{"title": "T", "kids": [103]}]), \
              patch("hn_jobs.fetch_comments", return_value=[comment]), \
              patch("hn_jobs.scrape_job_boards"), \
-             patch("hn_jobs.save_seen"), \
              patch("hn_jobs.rank_jobs_with_claude") as mock_rank, \
              patch("sys.argv", ["hn_jobs.py", "--dry-run"]):
             hn_jobs.main()
@@ -1328,12 +1347,11 @@ class TestRankingIntegration:
         self.mock_anthropic.Anthropic.return_value.messages.create.return_value = mock_response
 
         with patch.object(hn_jobs, "RESULTS_DIR", tmp_path), \
-             patch("hn_jobs.load_config", return_value={"resume_text": "I am an engineer", "preferences": {}}), \
-             patch("hn_jobs.load_seen", return_value={"posts": {}}), \
+             patch("hn_jobs.load_config", return_value={"resume_text": "I am an engineer", "preferences": {}, "filters": {"max_seniority": None, "coding_only": False}}), \
+             patch("hn_jobs.SeenTracker", _mock_tracker_class()), \
              patch("hn_jobs.find_hiring_threads", return_value=[{"title": "T", "kids": [104]}]), \
              patch("hn_jobs.fetch_comments", return_value=[comment]), \
              patch("hn_jobs.scrape_job_boards"), \
-             patch("hn_jobs.save_seen"), \
              patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}), \
              patch("sys.argv", ["hn_jobs.py", "--dry-run"]):
             hn_jobs.main()
@@ -1390,12 +1408,11 @@ class TestEnvironmentVariablesAdditional:
         """--no-email should not require email credentials."""
         comment = {"id": 105, "text": "Acme | SF | LLM engineer", "time": 0}
         with patch.object(hn_jobs, "RESULTS_DIR", tmp_path), \
-             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}}), \
-             patch("hn_jobs.load_seen", return_value={"posts": {}}), \
+             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}, "filters": {"max_seniority": None, "coding_only": False}}), \
+             patch("hn_jobs.SeenTracker", _mock_tracker_class()), \
              patch("hn_jobs.find_hiring_threads", return_value=[{"title": "T", "kids": [105]}]), \
              patch("hn_jobs.fetch_comments", return_value=[comment]), \
              patch("hn_jobs.scrape_job_boards"), \
-             patch("hn_jobs.save_seen"), \
              patch.dict(os.environ, {}, clear=True), \
              patch("sys.argv", ["hn_jobs.py", "--no-email"]):
             # Should not raise SystemExit even without email creds
@@ -1405,12 +1422,471 @@ class TestEnvironmentVariablesAdditional:
         """--dry-run should not require email credentials."""
         comment = {"id": 106, "text": "Acme | SF | LLM engineer", "time": 0}
         with patch.object(hn_jobs, "RESULTS_DIR", tmp_path), \
-             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}}), \
-             patch("hn_jobs.load_seen", return_value={"posts": {}}), \
+             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}, "filters": {"max_seniority": None, "coding_only": False}}), \
+             patch("hn_jobs.SeenTracker", _mock_tracker_class()), \
              patch("hn_jobs.find_hiring_threads", return_value=[{"title": "T", "kids": [106]}]), \
              patch("hn_jobs.fetch_comments", return_value=[comment]), \
              patch("hn_jobs.scrape_job_boards"), \
-             patch("hn_jobs.save_seen"), \
              patch.dict(os.environ, {}, clear=True), \
              patch("sys.argv", ["hn_jobs.py", "--dry-run"]):
             hn_jobs.main()
+
+
+# ---------------------------------------------------------------------------
+# Seniority estimation
+# ---------------------------------------------------------------------------
+
+class TestEstimateSeniority:
+    def test_staff_from_title(self):
+        assert hn_jobs.estimate_seniority("Staff Software Engineer") == "staff+"
+
+    def test_principal_from_title(self):
+        assert hn_jobs.estimate_seniority("Principal Engineer") == "staff+"
+
+    def test_senior_from_title(self):
+        assert hn_jobs.estimate_seniority("Senior Backend Engineer") == "senior"
+
+    def test_sr_dot_from_title(self):
+        assert hn_jobs.estimate_seniority("Sr. Software Engineer") == "senior"
+
+    def test_lead_from_title(self):
+        assert hn_jobs.estimate_seniority("Engineering Lead") == "senior"
+
+    def test_junior_from_title(self):
+        assert hn_jobs.estimate_seniority("Junior Developer") == "junior"
+
+    def test_intern_from_title(self):
+        assert hn_jobs.estimate_seniority("Engineering Intern") == "intern"
+
+    def test_founding_returns_unknown(self):
+        assert hn_jobs.estimate_seniority("Founding Engineer") == "unknown"
+
+    def test_plain_title_with_high_experience(self):
+        assert hn_jobs.estimate_seniority("Software Engineer", "Requires 10+ years") == "senior"
+
+    def test_plain_title_with_mid_experience(self):
+        assert hn_jobs.estimate_seniority("Software Engineer", "3+ years of experience") == "mid"
+
+    def test_plain_title_with_low_experience(self):
+        assert hn_jobs.estimate_seniority("Software Engineer", "1+ years") == "junior"
+
+    def test_no_signals_returns_unknown(self):
+        assert hn_jobs.estimate_seniority("Software Engineer") == "unknown"
+
+    def test_title_takes_priority_over_description(self):
+        assert hn_jobs.estimate_seniority("Junior Developer", "10+ years experience") == "junior"
+
+
+class TestSeniorityExceeds:
+    def test_senior_exceeds_mid(self):
+        assert hn_jobs.seniority_exceeds("senior", "mid") is True
+
+    def test_mid_does_not_exceed_senior(self):
+        assert hn_jobs.seniority_exceeds("mid", "senior") is False
+
+    def test_same_level_does_not_exceed(self):
+        assert hn_jobs.seniority_exceeds("mid", "mid") is False
+
+    def test_unknown_never_exceeds(self):
+        assert hn_jobs.seniority_exceeds("unknown", "junior") is False
+
+    def test_staff_exceeds_mid(self):
+        assert hn_jobs.seniority_exceeds("staff+", "mid") is True
+
+    def test_intern_does_not_exceed_anything(self):
+        assert hn_jobs.seniority_exceeds("intern", "intern") is False
+        assert hn_jobs.seniority_exceeds("intern", "junior") is False
+
+
+# ---------------------------------------------------------------------------
+# Job type classification
+# ---------------------------------------------------------------------------
+
+class TestIsCodingJob:
+    def test_software_engineer(self):
+        assert hn_jobs.is_coding_job("Software Engineer") is True
+
+    def test_backend_developer(self):
+        assert hn_jobs.is_coding_job("Backend Developer") is True
+
+    def test_ml_engineer(self):
+        assert hn_jobs.is_coding_job("ML Engineer") is True
+
+    def test_product_manager(self):
+        assert hn_jobs.is_coding_job("Product Manager") is False
+
+    def test_engineering_manager(self):
+        assert hn_jobs.is_coding_job("Engineering Manager") is False
+
+    def test_designer(self):
+        assert hn_jobs.is_coding_job("UX Designer") is False
+
+    def test_sales(self):
+        assert hn_jobs.is_coding_job("Account Executive") is False
+
+    def test_recruiter(self):
+        assert hn_jobs.is_coding_job("Recruiter") is False
+
+    def test_ambiguous_title_coding_description(self):
+        assert hn_jobs.is_coding_job("Team Member", "We need a backend engineer") is True
+
+    def test_ambiguous_title_non_coding_description(self):
+        assert hn_jobs.is_coding_job("Team Member", "Looking for a product manager") is False
+
+    def test_ambiguous_title_no_description(self):
+        # benefit of the doubt
+        assert hn_jobs.is_coding_job("Team Member") is True
+
+    def test_sre(self):
+        assert hn_jobs.is_coding_job("SRE") is True
+
+    def test_devops(self):
+        assert hn_jobs.is_coding_job("DevOps Engineer") is True
+
+    def test_director_of_engineering(self):
+        assert hn_jobs.is_coding_job("Director of Engineering") is False
+
+    def test_cto(self):
+        assert hn_jobs.is_coding_job("CTO") is False
+
+
+class TestParseCommentNewFields:
+    def test_role_extracted_from_header(self):
+        comment = {"id": 200, "text": "Acme | Senior Backend Engineer | SF, CA | Remote", "time": 0}
+        parsed = hn_jobs.parse_comment(comment)
+        assert "engineer" in parsed["role"].lower()
+        assert parsed["seniority"] == "senior"
+        assert parsed["is_coding"] is True
+
+    def test_non_coding_role_detected(self):
+        comment = {"id": 201, "text": "Acme | Product Manager | NYC", "time": 0}
+        parsed = hn_jobs.parse_comment(comment)
+        assert parsed["is_coding"] is False
+
+    def test_seniority_from_description(self):
+        comment = {"id": 202, "text": "Acme | Engineer\n\nRequires 10+ years of experience", "time": 0}
+        parsed = hn_jobs.parse_comment(comment)
+        assert parsed["seniority"] == "senior"
+
+
+# ---------------------------------------------------------------------------
+# parse-company-location-remote: Salary excluded from role/location
+# ---------------------------------------------------------------------------
+
+class TestParseCommentSalaryExclusion:
+    def test_salary_excluded_from_role_and_location(self):
+        comment = {"id": 300, "time": 0, "text": "Acme | Engineer | SF, CA | $150k-$200k"}
+        parsed = hn_jobs.parse_comment(comment)
+        assert "Engineer" in parsed["role"]
+        assert "SF, CA" in parsed["location"]
+        assert "$150k" not in parsed["role"]
+        assert "$150k" not in parsed["location"]
+
+    def test_non_location_parts_excluded(self):
+        comment = {"id": 301, "time": 0, "text": "Acme | Engineer | Full-time | Contract"}
+        parsed = hn_jobs.parse_comment(comment)
+        assert parsed["location"] == ""
+
+
+# ---------------------------------------------------------------------------
+# html-email-delivery: Subject line and inline styles
+# ---------------------------------------------------------------------------
+
+class TestHtmlEmailDeliverySubject:
+    def test_subject_line_format(self):
+        from email import message_from_string
+        from email.header import decode_header
+        mock_server = MagicMock()
+        with patch("hn_jobs.smtplib.SMTP_SSL") as mock_smtp:
+            mock_smtp.return_value.__enter__ = MagicMock(return_value=mock_server)
+            mock_smtp.return_value.__exit__ = MagicMock(return_value=False)
+            hn_jobs.send_email("<html>test</html>", "to@x.com", "from@x.com", "pass")
+
+        sent_raw = mock_server.sendmail.call_args[0][2]
+        msg = message_from_string(sent_raw)
+        parts = decode_header(msg["Subject"])
+        subject = parts[0][0]
+        if isinstance(subject, bytes):
+            subject = subject.decode(parts[0][1] or "utf-8")
+        month_year = datetime.now().strftime("%B %Y")
+        assert "HN Who" in subject
+        assert month_year in subject
+
+
+class TestHtmlEmailDeliveryInlineStyles:
+    def test_result_card_inline_styles(self):
+        results = [_make_result()]
+        html_output = hn_jobs.build_email_html(results, [], ["Thread"])
+        assert "border:1px solid" in html_output
+        assert "border-radius:8px" in html_output
+
+
+# ---------------------------------------------------------------------------
+# json-results-save: role, other_urls, seniority, is_coding fields
+# ---------------------------------------------------------------------------
+
+class TestJsonResultsFieldsDetailed:
+    def _run_dry_run(self, tmp_path, comment):
+        with patch.object(hn_jobs, "RESULTS_DIR", tmp_path), \
+             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}, "filters": {"max_seniority": None, "coding_only": False}}), \
+             patch("hn_jobs.SeenTracker", _mock_tracker_class()), \
+             patch("hn_jobs.find_hiring_threads", return_value=[{"title": "T", "kids": [comment["id"]]}]), \
+             patch("hn_jobs.fetch_comments", return_value=[comment]), \
+             patch("hn_jobs.scrape_job_boards"), \
+             patch("sys.argv", ["hn_jobs.py", "--dry-run"]):
+            hn_jobs.main()
+        json_files = list(tmp_path.glob("results_*.json"))
+        return json.loads(json_files[0].read_text())
+
+    def test_role_field_in_json(self, tmp_path):
+        comment = {"id": 310, "text": "Acme | Backend Engineer | SF | LLM tools", "time": 0}
+        data = self._run_dry_run(tmp_path, comment)
+        assert len(data["results"]) >= 1
+        assert "role" in data["results"][0]
+
+    def test_other_urls_field_in_json(self, tmp_path):
+        comment = {"id": 311, "text": 'Acme | SF | LLM engineer <a href="https://acme.com/careers">careers</a>', "time": 0}
+        data = self._run_dry_run(tmp_path, comment)
+        assert len(data["results"]) >= 1
+        assert "other_urls" in data["results"][0]
+
+    def test_seniority_and_is_coding_in_json(self, tmp_path):
+        comment = {"id": 312, "text": "Acme | Senior Backend Engineer | SF | LLM tools", "time": 0}
+        data = self._run_dry_run(tmp_path, comment)
+        assert len(data["results"]) >= 1
+        r = data["results"][0]
+        assert "seniority" in r
+        assert "is_coding" in r
+
+
+# ---------------------------------------------------------------------------
+# load-config: filters from config.yaml
+# ---------------------------------------------------------------------------
+
+class TestLoadConfigFilters:
+    def test_filters_from_config_yaml(self, tmp_path):
+        import yaml
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(yaml.dump({
+            "filters": {"max_seniority": "mid", "coding_only": True},
+        }))
+        with patch.object(hn_jobs, "CONFIG_FILE", config_file):
+            config = hn_jobs.load_config()
+        assert config["filters"]["max_seniority"] == "mid"
+        assert config["filters"]["coding_only"] is True
+
+    def test_default_filters_when_no_filters_key(self, tmp_path):
+        import yaml
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(yaml.dump({"preferences": {"remote": "preferred"}}))
+        with patch.object(hn_jobs, "CONFIG_FILE", config_file):
+            config = hn_jobs.load_config()
+        assert config["filters"]["max_seniority"] is None
+        assert config["filters"]["coding_only"] is False
+
+
+# ---------------------------------------------------------------------------
+# process-threads: direct unit tests
+# ---------------------------------------------------------------------------
+
+class TestProcessThreads:
+    def _make_comment(self, cid, text):
+        return {"id": cid, "text": text, "time": 0}
+
+    def test_return_tuple_structure_and_sorting(self):
+        c1 = self._make_comment(400, "Acme | SF | LLM engineer needed with rust and pytorch")
+        c2 = self._make_comment(401, "Beta | NYC | We use copilot for AI coding")
+        thread = {"title": "T", "kids": [400, 401]}
+
+        with patch("hn_jobs.fetch_comments", return_value=[c1, c2]), \
+             patch("hn_jobs.scrape_job_boards"):
+            results, filtered_out, all_seen_ids = hn_jobs.process_threads(
+                [thread], None, {"coding_only": False, "max_seniority": None},
+            )
+
+        # Returns a 3-tuple
+        assert isinstance(results, list)
+        assert isinstance(filtered_out, list)
+        assert isinstance(all_seen_ids, list)
+
+        # Results sorted by score descending
+        if len(results) > 1:
+            for i in range(len(results) - 1):
+                assert results[i]["score"] >= results[i + 1]["score"]
+
+        # seen_tracker=None means all comments processed (both IDs present)
+        assert "400" in all_seen_ids or "401" in all_seen_ids
+
+    def test_scrape_false_skips_scraping(self):
+        c1 = self._make_comment(410, "Acme | SF | LLM engineer needed")
+        thread = {"title": "T", "kids": [410]}
+
+        with patch("hn_jobs.fetch_comments", return_value=[c1]), \
+             patch("hn_jobs.scrape_job_boards") as mock_scrape:
+            hn_jobs.process_threads(
+                [thread], None, {"coding_only": False, "max_seniority": None},
+                scrape=False,
+            )
+
+        mock_scrape.assert_not_called()
+
+    def test_coding_only_filters_non_coding(self):
+        # Product Manager matches LLM but is non-coding
+        c1 = self._make_comment(420, "Acme | Product Manager | SF | We need someone for LLM strategy")
+        thread = {"title": "T", "kids": [420]}
+
+        with patch("hn_jobs.fetch_comments", return_value=[c1]), \
+             patch("hn_jobs.scrape_job_boards"):
+            results, filtered_out, _ = hn_jobs.process_threads(
+                [thread], None, {"coding_only": True, "max_seniority": None},
+            )
+
+        assert len(results) == 0
+        assert len(filtered_out) >= 1
+        assert any("non-coding" in r for item in filtered_out for r in item.get("neg_matches", []))
+
+    def test_max_seniority_filters_senior_roles(self):
+        # "Senior Engineer" — not a negative keyword, but seniority="senior" exceeds max "mid"
+        c1 = self._make_comment(430, "Acme | Senior Engineer | SF | LLM tools and AI coding")
+        thread = {"title": "T", "kids": [430]}
+
+        with patch("hn_jobs.fetch_comments", return_value=[c1]), \
+             patch("hn_jobs.scrape_job_boards"):
+            results, filtered_out, _ = hn_jobs.process_threads(
+                [thread], None, {"coding_only": False, "max_seniority": "mid"},
+            )
+
+        assert len(results) == 0
+        assert len(filtered_out) >= 1
+        assert any("seniority" in r for item in filtered_out for r in item.get("neg_matches", []))
+
+    def test_seen_tracker_skips_seen_ids(self):
+        c1 = self._make_comment(440, "Acme | SF | LLM engineer needed")
+        c2 = self._make_comment(441, "Beta | NYC | We use copilot")
+        thread = {"title": "T", "kids": [440, 441]}
+
+        tracker = SeenTracker("/dev/null", "posts")
+        tracker.mark(["440"])  # mark c1 as seen
+
+        with patch("hn_jobs.fetch_comments", return_value=[c1, c2]), \
+             patch("hn_jobs.scrape_job_boards"):
+            results, filtered_out, all_seen_ids = hn_jobs.process_threads(
+                [thread], tracker, {"coding_only": False, "max_seniority": None},
+            )
+
+        # c1 (440) was already seen, should be skipped
+        assert "440" not in all_seen_ids
+        assert "441" in all_seen_ids
+
+    def test_filtered_out_sorted_by_score(self):
+        # Two comments that both get filtered (non-US location)
+        c1 = self._make_comment(450, "Acme | Engineer | London | LLM tools")
+        c2 = self._make_comment(451, "Beta | Engineer | Berlin | LLM tools and rust and cuda")
+        thread = {"title": "T", "kids": [450, 451]}
+
+        with patch("hn_jobs.fetch_comments", return_value=[c1, c2]), \
+             patch("hn_jobs.scrape_job_boards"):
+            _, filtered_out, _ = hn_jobs.process_threads(
+                [thread], None, {"coding_only": False, "max_seniority": None},
+            )
+
+        if len(filtered_out) > 1:
+            for i in range(len(filtered_out) - 1):
+                assert filtered_out[i]["score"] >= filtered_out[i + 1]["score"]
+
+    def test_multiple_threads_iterated(self):
+        c1 = self._make_comment(460, "Acme | SF | LLM engineer")
+        c2 = self._make_comment(461, "Beta | NYC | We use copilot")
+        t1 = {"title": "T1", "kids": [460]}
+        t2 = {"title": "T2", "kids": [461]}
+
+        with patch("hn_jobs.fetch_comments", side_effect=[[c1], [c2]]), \
+             patch("hn_jobs.scrape_job_boards"):
+            results, _, all_seen_ids = hn_jobs.process_threads(
+                [t1, t2], None, {"coding_only": False, "max_seniority": None},
+            )
+
+        assert "460" in all_seen_ids
+        assert "461" in all_seen_ids
+
+    def test_no_keyword_match_silently_discarded(self):
+        c1 = self._make_comment(470, "Acme | SF | We sell insurance")
+        thread = {"title": "T", "kids": [470]}
+
+        with patch("hn_jobs.fetch_comments", return_value=[c1]), \
+             patch("hn_jobs.scrape_job_boards"):
+            results, filtered_out, all_seen_ids = hn_jobs.process_threads(
+                [thread], None, {"coding_only": False, "max_seniority": None},
+            )
+
+        assert len(results) == 0
+        assert len(filtered_out) == 0
+        assert "470" in all_seen_ids  # still tracked as seen
+
+
+# ---------------------------------------------------------------------------
+# html-email-delivery: sorted by Claude rank, HN orange header
+# ---------------------------------------------------------------------------
+
+class TestHtmlEmailRankSorting:
+    def test_claude_ranked_results_show_rank_badges(self):
+        r1 = _make_result(company="First", claude_rank=1, claude_reason="Best fit")
+        r2 = _make_result(company="Second", claude_rank=2, claude_reason="Good fit", post_id=2)
+        html_output = hn_jobs.build_email_html([r1, r2], [], ["Thread"])
+        # Rank badges should appear in order
+        pos1 = html_output.find("#1")
+        pos2 = html_output.find("#2")
+        assert pos1 < pos2
+
+    def test_html_contains_orange_header(self):
+        html_output = hn_jobs.build_email_html([], [], ["Thread"])
+        assert "#ff6600" in html_output
+
+
+# ---------------------------------------------------------------------------
+# terminal-output: --no-email triggers print
+# ---------------------------------------------------------------------------
+
+class TestTerminalOutputIntegration:
+    def test_no_email_triggers_terminal(self, tmp_path, capsys):
+        comment = {"id": 480, "text": "Acme | SF | LLM engineer", "time": 0}
+        with patch.object(hn_jobs, "RESULTS_DIR", tmp_path), \
+             patch("hn_jobs.load_config", return_value={"resume_text": None, "preferences": {}, "filters": {"max_seniority": None, "coding_only": False}}), \
+             patch("hn_jobs.SeenTracker", _mock_tracker_class()), \
+             patch("hn_jobs.find_hiring_threads", return_value=[{"title": "T", "kids": [480]}]), \
+             patch("hn_jobs.fetch_comments", return_value=[comment]), \
+             patch("hn_jobs.scrape_job_boards"), \
+             patch("sys.argv", ["hn_jobs.py", "--no-email"]):
+            hn_jobs.main()
+        output = capsys.readouterr().out
+        assert "Acme" in output
+
+
+# ---------------------------------------------------------------------------
+# waas-weighted-scoring: exact numeric scores
+# ---------------------------------------------------------------------------
+
+class TestWaasWeightedScoringExact:
+    def test_requirements_section_score(self):
+        from waas import _weighted_score
+        job = {
+            "job_title": "Engineer",
+            "job_description": "Requirements\nMust have experience with rust",
+            "job_tags": [],
+        }
+        matches = {"Systems": ["rust"]}
+        score = _weighted_score(job, matches)
+        # Systems(2) * requirements(2.0) = 4.0
+        assert score == 4.0
+
+    def test_description_section_score(self):
+        from waas import _weighted_score
+        job = {
+            "job_title": "Engineer",
+            "job_description": "We use rust in our stack",
+            "job_tags": [],
+        }
+        matches = {"Systems": ["rust"]}
+        score = _weighted_score(job, matches)
+        # Systems(2) * description(1.0) = 2.0
+        assert score == 2.0

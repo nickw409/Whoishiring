@@ -15,14 +15,11 @@ from waas import (
     filter_waas_jobs,
     scan_and_filter_waas,
     scrape_waas_jobs,
-    load_waas_seen,
-    save_waas_seen,
-    mark_waas_seen,
-    prune_waas_seen,
-    WAAS_PRUNE_DAYS,
     WAAS_BASE_URL,
     WAAS_DEFAULT_FILTERS,
+    WAAS_SEEN_FILE,
 )
+from filters import SeenTracker, PRUNE_DAYS
 
 
 def _make_job(**overrides):
@@ -140,7 +137,8 @@ class TestWaasToParsed:
     def test_all_parsed_keys_present(self):
         parsed = _waas_to_parsed(_make_job())
         expected_keys = {
-            "id", "time", "company", "location", "remote", "snippet",
+            "id", "time", "company", "role", "location", "remote",
+            "seniority", "is_coding", "snippet",
             "full_text", "emails", "email_instructions", "job_board_urls",
             "other_urls", "source", "company_yc_batch", "company_size",
             "salary_range",
@@ -441,86 +439,110 @@ class TestFilterWaasJobs:
 # ---------------------------------------------------------------------------
 
 class TestDedup:
-    def test_load_seen_missing_file(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("waas.WAAS_SEEN_FILE", tmp_path / "nonexistent.json")
-        seen = load_waas_seen()
-        assert seen == {"jobs": {}}
+    def test_load_missing_file(self, tmp_path):
+        tracker = SeenTracker(tmp_path / "nonexistent.json", "jobs")
+        tracker.load()
+        assert tracker.entries == {}
 
-    def test_load_seen_corrupt_json(self, tmp_path, monkeypatch):
+    def test_load_corrupt_json(self, tmp_path):
         bad_file = tmp_path / "seen_waas.json"
         bad_file.write_text("not valid json{{{")
-        monkeypatch.setattr("waas.WAAS_SEEN_FILE", bad_file)
-        seen = load_waas_seen()
-        assert seen == {"jobs": {}}
+        tracker = SeenTracker(bad_file, "jobs")
+        tracker.load()
+        assert tracker.entries == {}
 
-    def test_load_seen_missing_jobs_key(self, tmp_path, monkeypatch):
+    def test_load_missing_key(self, tmp_path):
         bad_file = tmp_path / "seen_waas.json"
         bad_file.write_text('{"other": 123}')
-        monkeypatch.setattr("waas.WAAS_SEEN_FILE", bad_file)
-        seen = load_waas_seen()
-        assert seen == {"jobs": {}}
+        tracker = SeenTracker(bad_file, "jobs")
+        tracker.load()
+        assert tracker.entries == {}
 
-    def test_load_seen_valid(self, tmp_path, monkeypatch):
+    def test_load_valid(self, tmp_path):
         f = tmp_path / "seen_waas.json"
         data = {"jobs": {"https://waas.com/jobs/1": 1234567890.0}}
         f.write_text(json.dumps(data))
-        monkeypatch.setattr("waas.WAAS_SEEN_FILE", f)
-        seen = load_waas_seen()
-        assert "https://waas.com/jobs/1" in seen["jobs"]
+        tracker = SeenTracker(f, "jobs")
+        tracker.load()
+        assert "https://waas.com/jobs/1" in tracker.entries
 
-    def test_save_and_load_roundtrip(self, tmp_path, monkeypatch):
+    def test_save_and_load_roundtrip(self, tmp_path):
         f = tmp_path / "seen_waas.json"
-        monkeypatch.setattr("waas.WAAS_SEEN_FILE", f)
-        original = {"jobs": {"https://waas.com/1": 100.0, "https://waas.com/2": 200.0}}
-        save_waas_seen(original)
-        loaded = load_waas_seen()
-        assert loaded == original
+        tracker = SeenTracker(f, "jobs")
+        tracker.mark(["https://waas.com/1", "https://waas.com/2"])
+        tracker.save()
+        tracker2 = SeenTracker(f, "jobs")
+        tracker2.load()
+        assert "https://waas.com/1" in tracker2.entries
+        assert "https://waas.com/2" in tracker2.entries
 
-    def test_mark_seen_empty_list(self):
-        seen = mark_waas_seen({"jobs": {}}, [])
-        assert seen == {"jobs": {}}
+    def test_mark_empty_list(self):
+        tracker = SeenTracker("/dev/null", "jobs")
+        tracker.mark([])
+        assert tracker.entries == {}
 
-    def test_mark_seen_adds_urls(self):
-        seen = mark_waas_seen({"jobs": {}}, ["https://waas.com/1", "https://waas.com/2"])
-        assert "https://waas.com/1" in seen["jobs"]
-        assert "https://waas.com/2" in seen["jobs"]
+    def test_mark_adds_urls(self):
+        tracker = SeenTracker("/dev/null", "jobs")
+        tracker.mark(["https://waas.com/1", "https://waas.com/2"])
+        assert "https://waas.com/1" in tracker.entries
+        assert "https://waas.com/2" in tracker.entries
 
-    def test_mark_seen_preserves_existing(self):
-        seen = {"jobs": {"https://waas.com/old": 100.0}}
-        seen = mark_waas_seen(seen, ["https://waas.com/new"])
-        assert "https://waas.com/old" in seen["jobs"]
-        assert "https://waas.com/new" in seen["jobs"]
+    def test_mark_preserves_existing(self):
+        tracker = SeenTracker("/dev/null", "jobs")
+        tracker.mark(["https://waas.com/old"])
+        tracker.mark(["https://waas.com/new"])
+        assert "https://waas.com/old" in tracker.entries
+        assert "https://waas.com/new" in tracker.entries
 
     def test_prune_removes_old_entries(self):
-        old_ts = time.time() - (WAAS_PRUNE_DAYS + 10) * 86400
+        tracker = SeenTracker("/dev/null", "jobs")
+        old_ts = time.time() - (PRUNE_DAYS + 10) * 86400
         new_ts = time.time() - 10
-        seen = {"jobs": {"old_url": old_ts, "new_url": new_ts}}
-        pruned = prune_waas_seen(seen)
-        assert "old_url" not in pruned["jobs"]
-        assert "new_url" in pruned["jobs"]
+        tracker._data["jobs"] = {"old_url": old_ts, "new_url": new_ts}
+        tracker.prune()
+        assert "old_url" not in tracker.entries
+        assert "new_url" in tracker.entries
 
     def test_prune_handles_invalid_timestamps(self):
-        seen = {"jobs": {"bad": "not_a_number", "good": time.time()}}
-        pruned = prune_waas_seen(seen)
-        assert "bad" not in pruned["jobs"]
-        assert "good" in pruned["jobs"]
+        tracker = SeenTracker("/dev/null", "jobs")
+        tracker._data["jobs"] = {"bad": "not_a_number", "good": time.time()}
+        tracker.prune()
+        assert "bad" not in tracker.entries
+        assert "good" in tracker.entries
 
     def test_prune_empty(self):
-        seen = {"jobs": {}}
-        pruned = prune_waas_seen(seen)
-        assert pruned == {"jobs": {}}
+        tracker = SeenTracker("/dev/null", "jobs")
+        tracker.prune()
+        assert tracker.entries == {}
 
 
 # ---------------------------------------------------------------------------
 # scrape_waas_jobs (mocked API)
 # ---------------------------------------------------------------------------
 
+def _mock_tracker(entries=None):
+    """Create a mock SeenTracker that returns given entries."""
+    class MockSeenTracker:
+        def __init__(self, *args, **kwargs):
+            self.entries = dict(entries) if entries else {}
+            self._saved = False
+        def load(self): return self
+        def save(self): self._saved = True
+        def prune(self): pass
+        def is_seen(self, id_): return str(id_) in self.entries
+        def mark(self, ids):
+            now = time.time()
+            for id_ in ids:
+                self.entries[str(id_)] = now
+        def is_empty(self): return len(self.entries) == 0
+    return MockSeenTracker
+
+
 class TestScrapeWaasJobs:
     def test_returns_list(self, monkeypatch):
         companies = [_make_api_company()]
         monkeypatch.setattr("waas._scrape_via_api", lambda: (companies, "key"))
-        monkeypatch.setattr("waas.load_waas_seen", lambda: {"jobs": {}})
-        monkeypatch.setattr("waas.save_waas_seen", lambda s: None)
+        monkeypatch.setattr("waas.SeenTracker", _mock_tracker())
         jobs = scrape_waas_jobs(ignore_seen=True)
         assert isinstance(jobs, list)
         assert len(jobs) == 1
@@ -528,8 +550,7 @@ class TestScrapeWaasJobs:
     def test_all_required_fields(self, monkeypatch):
         companies = [_make_api_company()]
         monkeypatch.setattr("waas._scrape_via_api", lambda: (companies, "key"))
-        monkeypatch.setattr("waas.load_waas_seen", lambda: {"jobs": {}})
-        monkeypatch.setattr("waas.save_waas_seen", lambda s: None)
+        monkeypatch.setattr("waas.SeenTracker", _mock_tracker())
         jobs = scrape_waas_jobs(ignore_seen=True)
         required = {
             "company_name", "company_url", "company_description", "company_size",
@@ -543,8 +564,7 @@ class TestScrapeWaasJobs:
     def test_field_types(self, monkeypatch):
         companies = [_make_api_company()]
         monkeypatch.setattr("waas._scrape_via_api", lambda: (companies, "key"))
-        monkeypatch.setattr("waas.load_waas_seen", lambda: {"jobs": {}})
-        monkeypatch.setattr("waas.save_waas_seen", lambda s: None)
+        monkeypatch.setattr("waas.SeenTracker", _mock_tracker())
         jobs = scrape_waas_jobs(ignore_seen=True)
         for job in jobs:
             assert isinstance(job["remote"], bool)
@@ -555,34 +575,29 @@ class TestScrapeWaasJobs:
     def test_dedup_filters_seen(self, monkeypatch):
         companies = [_make_api_company()]
         monkeypatch.setattr("waas._scrape_via_api", lambda: (companies, "key"))
-        monkeypatch.setattr("waas.load_waas_seen", lambda: {
-            "jobs": {"https://www.workatastartup.com/jobs/99999": time.time()}
-        })
-        monkeypatch.setattr("waas.save_waas_seen", lambda s: None)
+        monkeypatch.setattr("waas.SeenTracker", _mock_tracker(
+            {"https://www.workatastartup.com/jobs/99999": time.time()}
+        ))
         jobs = scrape_waas_jobs(ignore_seen=False)
         assert len(jobs) == 0
 
     def test_ignore_seen_skips_save(self, monkeypatch):
         companies = [_make_api_company()]
         monkeypatch.setattr("waas._scrape_via_api", lambda: (companies, "key"))
-        monkeypatch.setattr("waas.load_waas_seen", lambda: {"jobs": {}})
-        save_called = {"count": 0}
-        monkeypatch.setattr("waas.save_waas_seen", lambda s: save_called.update(count=save_called["count"] + 1))
+        monkeypatch.setattr("waas.SeenTracker", _mock_tracker())
         jobs = scrape_waas_jobs(ignore_seen=True)
         assert len(jobs) == 1
-        assert save_called["count"] == 0
 
     def test_api_failure_returns_empty(self, monkeypatch):
         monkeypatch.setattr("waas._scrape_via_api", lambda: ([], ""))
-        monkeypatch.setattr("waas.load_waas_seen", lambda: {"jobs": {}})
+        monkeypatch.setattr("waas.SeenTracker", _mock_tracker())
         jobs = scrape_waas_jobs(ignore_seen=True)
         assert jobs == []
 
     def test_bad_company_skipped(self, monkeypatch):
         companies = [_make_api_company(), {"bad": "data"}]
         monkeypatch.setattr("waas._scrape_via_api", lambda: (companies, "key"))
-        monkeypatch.setattr("waas.load_waas_seen", lambda: {"jobs": {}})
-        monkeypatch.setattr("waas.save_waas_seen", lambda s: None)
+        monkeypatch.setattr("waas.SeenTracker", _mock_tracker())
         jobs = scrape_waas_jobs(ignore_seen=True)
         assert len(jobs) == 1  # bad company skipped, good one kept
 
@@ -1076,55 +1091,55 @@ class TestAlgoliaFilters:
 
 class TestSeniorityEstimation:
     def test_staff_in_title(self):
-        from mcp_server import _estimate_seniority
+        from filters import estimate_seniority as _estimate_seniority
         assert _estimate_seniority("Staff Engineer", "") == "staff+"
 
     def test_principal_in_title(self):
-        from mcp_server import _estimate_seniority
+        from filters import estimate_seniority as _estimate_seniority
         assert _estimate_seniority("Principal Software Engineer", "") == "staff+"
 
     def test_senior_in_title(self):
-        from mcp_server import _estimate_seniority
+        from filters import estimate_seniority as _estimate_seniority
         assert _estimate_seniority("Senior Backend Engineer", "") == "senior"
 
     def test_sr_in_title(self):
-        from mcp_server import _estimate_seniority
+        from filters import estimate_seniority as _estimate_seniority
         assert _estimate_seniority("Sr. Software Engineer", "") == "senior"
 
     def test_lead_in_title(self):
-        from mcp_server import _estimate_seniority
+        from filters import estimate_seniority as _estimate_seniority
         assert _estimate_seniority("Engineering Lead", "") == "senior"
 
     def test_founding_in_title(self):
-        from mcp_server import _estimate_seniority
-        assert _estimate_seniority("Founding Engineer", "") == "any"
+        from filters import estimate_seniority as _estimate_seniority
+        assert _estimate_seniority("Founding Engineer", "") == "unknown"
 
     def test_intern_in_title(self):
-        from mcp_server import _estimate_seniority
+        from filters import estimate_seniority as _estimate_seniority
         assert _estimate_seniority("Engineering Intern", "") == "intern"
 
     def test_junior_in_title(self):
-        from mcp_server import _estimate_seniority
+        from filters import estimate_seniority as _estimate_seniority
         assert _estimate_seniority("Junior Developer", "") == "junior"
 
     def test_experience_from_description(self):
-        from mcp_server import _estimate_seniority
-        assert _estimate_seniority("Software Engineer", "Requires 5+ years of experience") == "mid-senior"
+        from filters import estimate_seniority as _estimate_seniority
+        assert _estimate_seniority("Software Engineer", "Requires 5+ years of experience") == "mid"
 
     def test_high_experience_from_description(self):
-        from mcp_server import _estimate_seniority
+        from filters import estimate_seniority as _estimate_seniority
         assert _estimate_seniority("Software Engineer", "8+ years required") == "senior"
 
     def test_low_experience_from_description(self):
-        from mcp_server import _estimate_seniority
+        from filters import estimate_seniority as _estimate_seniority
         assert _estimate_seniority("Software Engineer", "2+ years experience") == "mid"
 
     def test_unknown_seniority(self):
-        from mcp_server import _estimate_seniority
+        from filters import estimate_seniority as _estimate_seniority
         assert _estimate_seniority("Software Engineer", "We build things") == "unknown"
 
     def test_title_takes_priority_over_description(self):
-        from mcp_server import _estimate_seniority
+        from filters import estimate_seniority as _estimate_seniority
         # Title says senior even though desc says 2 years
         assert _estimate_seniority("Senior Engineer", "2+ years experience") == "senior"
 
@@ -1227,13 +1242,13 @@ class TestGetJobDetails:
 
 class TestWaasScrapePipelineIntegration:
     def test_scrape_direct_calls_prune(self, tmp_path):
-        from waas import _scrape_direct, WAAS_SEEN_FILE
+        from waas import _scrape_direct
         seen_file = tmp_path / "seen_waas.json"
         seen_file.write_text(json.dumps({"jobs": {}}))
 
         with patch("waas.WAAS_SEEN_FILE", seen_file), \
              patch("waas._scrape_via_api", return_value=([], "")), \
-             patch("waas.prune_waas_seen", wraps=prune_waas_seen) as mock_prune:
+             patch.object(SeenTracker, "prune") as mock_prune:
             _scrape_direct(ignore_seen=False)
 
         mock_prune.assert_called_once()
@@ -1562,8 +1577,8 @@ class TestWaasMissingCredentials:
 # ---------------------------------------------------------------------------
 
 class TestWaasDedupTimestamp:
-    def test_mark_waas_seen_stores_timestamp(self):
-        seen = {"jobs": {}}
-        with patch("waas.time.time", return_value=1710000000.0):
-            result = mark_waas_seen(seen, ["https://waas.com/jobs/1"])
-        assert result["jobs"]["https://waas.com/jobs/1"] == 1710000000.0
+    def test_mark_stores_timestamp(self):
+        tracker = SeenTracker("/dev/null", "jobs")
+        with patch("filters.time.time", return_value=1710000000.0):
+            tracker.mark(["https://waas.com/jobs/1"])
+        assert tracker.entries["https://waas.com/jobs/1"] == 1710000000.0

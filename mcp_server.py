@@ -14,6 +14,7 @@ from mcp.server.fastmcp import FastMCP
 
 import hn_jobs
 import waas
+from filters import SeenTracker, estimate_seniority
 
 mcp = FastMCP(name="HN Who's Hiring")
 
@@ -25,59 +26,28 @@ def _scan_hn(months: int, ignore_seen: bool) -> tuple[list[dict], list[dict], li
         (results, filtered_out, thread_titles)
     """
     months = max(1, min(3, months))
+    config = hn_jobs.load_config()
+    config_filters = config.get("filters", {})
 
-    seen = hn_jobs.load_seen() if not ignore_seen else {"posts": {}}
+    tracker = None
+    if not ignore_seen:
+        tracker = SeenTracker(hn_jobs.SEEN_FILE, "posts")
+        tracker.load()
+
     threads = hn_jobs.find_hiring_threads(max_threads=months)
     if not threads:
         return [], [], []
 
     thread_titles = [t.get("title", "Unknown") for t in threads]
 
-    results = []
-    filtered_out = []
-    all_seen_ids = []
+    results, filtered_out, all_seen_ids = hn_jobs.process_threads(
+        threads, tracker, config_filters,
+    )
 
-    for thread in threads:
-        comments = hn_jobs.fetch_comments(thread)
-        for comment in comments:
-            cid = str(comment["id"])
-            if cid in seen.get("posts", {}):
-                continue
-
-            all_seen_ids.append(cid)
-            raw_text = hn_jobs.strip_html(comment.get("text", ""))
-
-            matches = hn_jobs.match_keywords(raw_text)
-            if not matches:
-                continue
-
-            neg = hn_jobs.match_negative(raw_text)
-            score = hn_jobs.score_matches(matches)
-            parsed = hn_jobs.parse_comment(comment)
-            hn_jobs.scrape_job_boards(parsed)
-
-            item = {
-                "parsed": parsed,
-                "matches": matches,
-                "score": score,
-                "thread_title": thread.get("title", ""),
-            }
-
-            if neg:
-                item["neg_matches"] = neg
-                filtered_out.append(item)
-            elif hn_jobs.is_outside_us(parsed):
-                item["neg_matches"] = ["non-US location"]
-                filtered_out.append(item)
-            else:
-                results.append(item)
-
-    results.sort(key=lambda x: x["score"], reverse=True)
-
-    if not ignore_seen:
-        hn_jobs.mark_seen(seen, all_seen_ids)
-        hn_jobs.prune_seen(seen)
-        hn_jobs.save_seen(seen)
+    if tracker and not ignore_seen:
+        tracker.mark(all_seen_ids)
+        tracker.prune()
+        tracker.save()
 
     return results, filtered_out, thread_titles
 
@@ -91,8 +61,11 @@ def _format_hn_results(results: list[dict]) -> list[dict]:
         snippet = _build_keyword_snippet(p["full_text"], keywords)
         output.append({
             "company": p["company"],
+            "role": p.get("role", ""),
             "location": p["location"],
             "remote": p["remote"],
+            "seniority": p.get("seniority", "unknown"),
+            "is_coding": p.get("is_coding", True),
             "score": item["score"],
             "matched_categories": list(item["matches"].keys()),
             "matched_keywords": keywords,
@@ -165,56 +138,6 @@ def _build_keyword_snippet(text: str, keywords: list[str], limit: int = DESC_LIM
     return " ... ".join(parts)
 
 
-_SENIORITY_TITLE_RE = re.compile(
-    r"\b(staff|principal|senior|lead|sr\.?|founding)\b", re.IGNORECASE
-)
-_EXPERIENCE_RE = re.compile(r"(\d+)\+?\s*(?:years?|yrs?)\b", re.IGNORECASE)
-
-
-def _estimate_seniority(title: str, description: str, min_experience: str = "") -> str:
-    """Estimate seniority level from title, description, and experience requirement."""
-    title_lower = title.lower()
-
-    if any(kw in title_lower for kw in ["staff", "principal"]):
-        return "staff+"
-    if any(kw in title_lower for kw in ["senior", "sr.", "sr "]):
-        return "senior"
-    if any(kw in title_lower for kw in ["lead"]):
-        return "senior"
-    if any(kw in title_lower for kw in ["founding"]):
-        return "any"
-    if any(kw in title_lower for kw in ["intern"]):
-        return "intern"
-    if any(kw in title_lower for kw in ["junior", "jr.", "jr "]):
-        return "junior"
-
-    # Check experience years in description
-    exp_matches = _EXPERIENCE_RE.findall(description[:1000])
-    if exp_matches:
-        max_years = max(int(y) for y in exp_matches)
-        if max_years >= 8:
-            return "senior"
-        if max_years >= 4:
-            return "mid-senior"
-        if max_years >= 2:
-            return "mid"
-        return "junior-mid"
-
-    # Fall back to min_experience field from API
-    if min_experience:
-        try:
-            years = int(min_experience.replace("+", "").split()[0])
-            if years >= 6:
-                return "senior"
-            if years >= 3:
-                return "mid"
-            return "junior-mid"
-        except (ValueError, IndexError):
-            pass
-
-    return "unknown"
-
-
 def _dedup_by_company(results: list[dict]) -> list[dict]:
     """Keep only the highest-scoring role per company. Adds other_roles_count."""
     company_groups: dict[str, list[dict]] = {}
@@ -267,7 +190,8 @@ def _format_waas_results(results: list[dict]) -> list[dict]:
             "salary_range": p.get("salary_range", ""),
             "company_yc_batch": p.get("company_yc_batch", ""),
             "company_size": p.get("company_size", ""),
-            "seniority": _estimate_seniority(job_title, p["full_text"]),
+            "seniority": p.get("seniority") or estimate_seniority(job_title, p["full_text"]),
+            "is_coding": p.get("is_coding", True),
             "source": "waas",
         }
         output.append(formatted)
@@ -541,6 +465,8 @@ def update_config(
     resume: str | None = None,
     remote_preference: str | None = None,
     preference_notes: str | None = None,
+    max_seniority: str | None = None,
+    coding_only: bool | None = None,
     waas_role: str | None = None,
     waas_eng_type: str | None = None,
     waas_remote: str | None = None,
@@ -552,7 +478,7 @@ def update_config(
 ) -> str:
     """Update config.yaml settings. Only provided fields are changed; others are preserved.
 
-    Use this to adjust preferences, resume path, or WAAS search filters.
+    Use this to adjust preferences, resume path, WAAS search filters, or result filters.
     To disable/clear a WAAS filter, pass "any" as the value (NOT null).
     Omit a field entirely to leave it unchanged.
     Use comma-separated values for OR logic (e.g. "0,1" for min_experience 0 OR 1).
@@ -561,6 +487,8 @@ def update_config(
         resume: Path to PDF resume file for ranking.
         remote_preference: Remote work preference (e.g. "preferred", "required", "flexible").
         preference_notes: Free-form notes about what you're looking for, sent to the ranker.
+        max_seniority: Maximum seniority level to include. Values: intern, junior, mid, senior, staff+. Jobs above this level are filtered out. Pass "any" to disable.
+        coding_only: If true, filter out non-coding roles (product, design, sales, management, etc.).
         waas_role: WAAS role filter. Values: eng, sales, operations, marketing, product, or "any" to disable/clear.
         waas_eng_type: WAAS engineering type. Values: fs, be, ml, fe, eng_mgmt, devops, embedded, or "any". Comma-separated for multiple.
         waas_remote: WAAS remote filter. Values: yes, only, no, or "any" to disable/clear. Comma-separated for multiple.
@@ -591,6 +519,18 @@ def update_config(
         if preference_notes is not None:
             prefs["notes"] = preference_notes
         config["preferences"] = prefs
+
+    # Result filters (seniority, coding_only)
+    if max_seniority is not None or coding_only is not None:
+        filters = config.get("filters", {}) or {}
+        if max_seniority is not None:
+            if max_seniority.lower() == "any":
+                filters.pop("max_seniority", None)
+            else:
+                filters["max_seniority"] = max_seniority
+        if coding_only is not None:
+            filters["coding_only"] = coding_only
+        config["filters"] = filters
 
     # WAAS filters
     waas_args = {

@@ -19,32 +19,43 @@ sections:
     - name: Keyword Matching and Scoring
       path: tests/
       file:
-        - hn_jobs.py
+        - filters.py
         - waas.py
       description: |
-        Matches job post text against keyword categories and computes relevance scores.
+        Matches job post text against keyword categories and computes relevance scores. Shared logic lives in filters.py; WAAS-specific weighted scoring lives in waas.py.
       behaviors:
         - name: category-keyword-matching
           description: |
-            Matches post text against three keyword categories using word-boundary case-insensitive regex: AI tooling (weight 3, keywords like "claude code", "copilot", "cursor", "llm"), Systems (weight 2, keywords like "rust", "cuda", "gpu"), General AI+SWE (weight 1, keywords like "machine learning", "pytorch"). Returns matched categories with their specific keyword hits.
+            Matches post text against three keyword categories using word-boundary case-insensitive regex: AI tooling (weight 3, keywords like "claude code", "copilot", "cursor", "llm"), Systems (weight 2, keywords like "rust", "cuda", "gpu"), General AI+SWE (weight 1, keywords like "machine learning", "pytorch"). Returns matched categories with their specific keyword hits. Defined in filters.py, used by hn_jobs.py and waas.py.
         - name: per-category-scoring
           description: |
-            Scores posts by summing the weight of each matched category exactly once, regardless of how many keywords matched within that category. A post matching "claude code" and "copilot" (both AI tooling) scores 3, not 6. A post matching AI tooling + Systems scores 5.
+            Scores posts by summing the weight of each matched category exactly once, regardless of how many keywords matched within that category. A post matching "claude code" and "copilot" (both AI tooling) scores 3, not 6. A post matching AI tooling + Systems scores 5. Defined in filters.score_matches().
         - name: waas-weighted-scoring
           description: |
             For WAAS jobs, scores keywords by where they appear in the job description: title (3.0x), requirements section (2.0x), general description (1.0x), nice-to-have section (0.5x), tags (0.3x). Multiplies location weight by category weight for each matched keyword and sums the result.
     - name: Filtering
       path: tests/
-      file: hn_jobs.py
+      file:
+        - filters.py
+        - hn_jobs.py
       description: |
-        Filters posts by negative keywords (seniority/management) and location (non-US, non-remote).
+        Filters posts by negative keywords, location, seniority, and job type. All filter primitives live in filters.py. The filter cascade is applied via filters.apply_filters(), called from hn_jobs.process_threads() and waas.filter_waas_jobs().
       behaviors:
         - name: negative-keyword-filter
           description: |
-            Matches posts against negative keywords ("staff engineer", "principal engineer", "engineering manager", "director of", "vp of", "10+ years", "15+ years") using word-boundary case-insensitive regex. Posts matching both positive and negative keywords are placed in a "Filtered Out" section (not silently dropped). Posts matching only negative keywords with no positive matches are discarded entirely.
+            Matches posts against negative keywords ("staff engineer", "principal engineer", "engineering manager", "director of", "vp of", "10+ years", "15+ years") using word-boundary case-insensitive regex. Posts matching both positive and negative keywords are placed in a "Filtered Out" section (not silently dropped). Posts matching only negative keywords with no positive matches are discarded entirely. Defined in filters.match_negative().
         - name: location-filter
           description: |
-            Filters out non-US, non-remote jobs. Remote jobs always pass. Jobs with no detected location pass (benefit of the doubt). Jobs matching US city/state patterns pass. Jobs matching non-US city/country patterns are filtered out and placed in the "Filtered Out" section with reason "non-US location".
+            Filters out non-US, non-remote jobs. Remote jobs always pass. Jobs with no detected location pass (benefit of the doubt). Jobs matching US city/state patterns pass. Jobs matching non-US city/country patterns are filtered out and placed in the "Filtered Out" section with reason "non-US location". Defined in filters.is_outside_us().
+        - name: seniority-filter
+          description: |
+            Estimates seniority from job title keywords (staff/principal → staff+, senior/sr./lead → senior, junior/jr. → junior, intern → intern, founding → unknown) and description experience requirements (8+ years → senior, 4+ → mid, 2+ → mid, <2 → junior). When filters.max_seniority is set in config.yaml, jobs above that level are filtered out. Unknown seniority is never filtered (benefit of the doubt). Defined in filters.estimate_seniority() and filters.seniority_exceeds().
+        - name: coding-job-filter
+          description: |
+            Classifies jobs as coding (engineer, developer, SRE, devops, etc.) vs non-coding (product manager, designer, sales, recruiter, etc.). Engineering management (engineering manager, director of engineering, CTO) is classified as non-coding. When filters.coding_only is true in config.yaml, non-coding roles are filtered out. Unknown job types are kept (benefit of the doubt). Defined in filters.is_coding_job().
+        - name: apply-filters-cascade
+          description: |
+            Single function filters.apply_filters() applies the full cascade: negative keywords → location → coding → seniority. Returns None if accepted, or a list of filter reasons if rejected. Used by hn_jobs.process_threads() and waas.filter_waas_jobs() to eliminate the previously duplicated if/elif chain.
     - name: Comment Parsing
       path: tests/
       file: hn_jobs.py
@@ -53,7 +64,7 @@ sections:
       behaviors:
         - name: parse-company-location-remote
           description: |
-            Extracts company name, location, and remote status from the pipe-delimited header line of HN comments. Produces a structured record with these fields plus a text snippet.
+            Extracts company name, role, location, and remote status from the pipe-delimited header line of HN comments. Also computes seniority estimate and coding classification from the extracted role. Produces a structured record with these fields plus a text snippet.
         - name: extract-emails-and-instructions
           description: |
             Extracts email addresses from post text and captures surrounding application instructions (±120 characters around each email) for context on how to apply.
@@ -77,24 +88,22 @@ sections:
             Waits 0.5 seconds between consecutive job board scrape requests to avoid rate limiting. Sends a descriptive User-Agent header with requests.
     - name: Deduplication
       path: tests/
-      file:
-        - hn_jobs.py
-        - waas.py
+      file: filters.py
       description: |
-        Tracks seen posts/jobs across runs to avoid showing duplicates.
+        Tracks seen posts/jobs across runs via the SeenTracker class in filters.py. Both HN and WAAS use SeenTracker with different file paths and keys.
       behaviors:
         - name: hn-dedup-tracking
           description: |
-            Stores seen HN comment IDs with timestamps in seen_posts.json. On subsequent runs, skips any previously seen comment IDs. New comment IDs are marked with current timestamp after processing.
+            Stores seen HN comment IDs with timestamps in seen_posts.json via SeenTracker. On subsequent runs, skips any previously seen comment IDs. New comment IDs are marked with current timestamp after processing.
         - name: waas-dedup-tracking
           description: |
-            Stores seen WAAS job URLs with timestamps in seen_waas.json. On subsequent runs, skips any previously seen job URLs. New job URLs are marked with current timestamp after processing.
+            Stores seen WAAS job URLs with timestamps in seen_waas.json via SeenTracker. On subsequent runs, skips any previously seen job URLs. New job URLs are marked with current timestamp after processing.
         - name: auto-prune
           description: |
-            Automatically removes entries older than 180 days from both seen_posts.json and seen_waas.json when loading the dedup files.
+            SeenTracker.prune() automatically removes entries older than 180 days (PRUNE_DAYS constant in filters.py, shared by both HN and WAAS).
         - name: ignore-seen-mode
           description: |
-            When ignore_seen is true, bypasses dedup filtering and does not update the seen files, avoiding pollution of the seen list during exploratory scans.
+            When ignore_seen is true, no SeenTracker is created, bypassing dedup filtering entirely and not updating seen files. Avoids pollution of the seen list during exploratory scans.
     - name: Claude Ranking
       path: tests/
       file: hn_jobs.py
@@ -127,7 +136,7 @@ sections:
             With --no-email flag, prints results to terminal with formatting including company, location, score, matched keywords, and application links.
         - name: json-results-save
           description: |
-            Always saves structured JSON results to results/results_<timestamp>.json containing scan time, thread titles, full result objects (id, company, location, remote, score, matched categories/keywords, job board URLs, emails), and filtered out count.
+            Always saves structured JSON results to results/results_<timestamp>.json containing scan time, thread titles, full result objects (id, company, role, location, remote, seniority, is_coding, score, matched categories/keywords, job board URLs, emails), and filtered out count.
         - name: keyword-highlighting
           description: |
             In HTML output, wraps matched keywords in the post snippet with highlighted markup so they are visually distinct.
@@ -151,7 +160,7 @@ sections:
             Fetches full company data in batches of 10 by POSTing to /companies/fetch with a CSRF token extracted from the page DOM. Includes a 0.3s delay between batches. Flattens company data into individual job records with title, URL, location, remote status, salary, skills, and detail string.
         - name: waas-keyword-filter
           description: |
-            Applies the same keyword matching, negative keyword filtering, and location filtering as HN posts. Produces results and filtered_out lists in the same format as HN for unified output.
+            Applies the same keyword matching, negative keyword filtering, location filtering, seniority filtering, and coding job filtering as HN posts via filters.apply_filters(). Produces results and filtered_out lists in the same format as HN for unified output.
         - name: cross-source-dedup
           description: |
             When combining HN and WAAS results, deduplicates by company name (case-insensitive, whitespace-stripped). HN results take priority over WAAS results for the same company.
@@ -165,7 +174,7 @@ sections:
       path: tests/
       file: mcp_server.py
       description: |
-        Exposes the scan pipeline as MCP tools for Claude Desktop via stdio transport.
+        Exposes the scan pipeline as MCP tools for Claude Desktop via stdio transport. Uses hn_jobs.process_threads() for HN scanning and waas.filter_waas_jobs() for WAAS filtering.
       behaviors:
         - name: scan-jobs-tool
           description: |
@@ -185,6 +194,9 @@ sections:
         - name: get-latest-results-tool
           description: |
             The get_latest_results tool returns the most recently saved JSON results file from the results directory.
+        - name: mcp-prompts-registration
+          description: |
+            Server registers MCP prompts (find_jobs, rerank_results, scan_overview, backfill, waas_only) via prompts/list. These provide pre-built workflows for Claude Desktop but are not currently surfaced in its UI.
     - name: Configuration
       path: tests/
       file:
@@ -195,6 +207,15 @@ sections:
       behaviors:
         - name: load-config
           description: |
-            Loads config.yaml (optional file) and returns resume text (extracted from configured PDF path) and preferences object. The --resume CLI flag overrides the config file resume path. Returns None for resume_text if no resume is configured.
+            Loads config.yaml (optional file) and returns resume text (extracted from configured PDF path), preferences object, and filters object (max_seniority, coding_only). The --resume CLI flag overrides the config file resume path. Returns None for resume_text if no resume is configured.
         - name: environment-variables
           description: Reads ANTHROPIC_API_KEY for Claude ranking, HN_JOBS_EMAIL_TO/FROM/PASSWORD for email delivery, and WAAS_USERNAME/WAAS_PASSWORD for YC authentication. Missing email credentials cause sys.exit(1) when email mode is active; --no-email and --dry-run bypass the check entirely. Missing API key skips Claude ranking with a warning. Missing WAAS credentials return empty results from the API scraper.
+    - name: Process Threads
+      path: tests/
+      file: hn_jobs.py
+      description: |
+        Shared HN comment processing pipeline extracted from main() for reuse by the MCP server.
+      behaviors:
+        - name: process-threads
+          description: |
+            hn_jobs.process_threads() takes a list of threads, a SeenTracker (or None), and config filters, then iterates all comments: dedup check, keyword match, negative match, parse, scrape job boards, and apply_filters cascade. Returns (results, filtered_out, all_seen_ids) sorted by score descending. Called by both hn_jobs.main() and mcp_server._scan_hn().

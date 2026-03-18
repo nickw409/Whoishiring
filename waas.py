@@ -11,6 +11,14 @@ from typing import Any
 
 import requests as http_requests
 
+from filters import (
+    KEYWORD_CATEGORIES, PRUNE_DAYS,
+    _kw_patterns,
+    match_keywords, match_negative,
+    estimate_seniority, is_coding_job,
+    apply_filters, SeenTracker,
+)
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -24,7 +32,6 @@ WAAS_FETCH_URL = "https://www.workatastartup.com/companies/fetch"
 WAAS_ALGOLIA_URL = "https://45bwzj1sgc-dsn.algolia.net/1/indexes/*/queries"
 WAAS_ALGOLIA_INDEX = "WaaSPublicCompanyJob_production"
 WAAS_SEEN_FILE = Path(__file__).parent / "seen_waas.json"
-WAAS_PRUNE_DAYS = 180
 WAAS_FETCH_BATCH_SIZE = 10
 
 # Algolia filter defaults. Set to None to disable a filter.
@@ -84,47 +91,6 @@ def _build_algolia_filter_string(filters: dict) -> str:
             parts.append(f"({or_clause})")
 
     return " AND ".join(parts)
-
-# ---------------------------------------------------------------------------
-# Deduplication
-# ---------------------------------------------------------------------------
-
-def load_waas_seen() -> dict[str, dict[str, float]]:
-    """Load seen WAAS job URLs from disk."""
-    if WAAS_SEEN_FILE.exists():
-        try:
-            data = json.loads(WAAS_SEEN_FILE.read_text())
-            if "jobs" not in data:
-                data = {"jobs": {}}
-            return data
-        except (json.JSONDecodeError, KeyError):
-            logger.warning("Corrupt seen_waas.json, starting fresh")
-            return {"jobs": {}}
-    return {"jobs": {}}
-
-
-def save_waas_seen(seen: dict[str, dict[str, float]]) -> None:
-    """Save seen WAAS job URLs to disk."""
-    WAAS_SEEN_FILE.write_text(json.dumps(seen, indent=2))
-
-
-def mark_waas_seen(seen: dict[str, dict[str, float]], job_urls: list[str]) -> dict[str, dict[str, float]]:
-    """Mark job URLs as seen with current timestamp."""
-    now = time.time()
-    for url in job_urls:
-        seen["jobs"][url] = now
-    return seen
-
-
-def prune_waas_seen(seen: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
-    """Remove entries older than WAAS_PRUNE_DAYS."""
-    cutoff = time.time() - (WAAS_PRUNE_DAYS * 86400)
-    seen["jobs"] = {
-        url: ts for url, ts in seen["jobs"].items()
-        if isinstance(ts, (int, float)) and ts > cutoff
-    }
-    return seen
-
 
 # ---------------------------------------------------------------------------
 # Auth + API helpers
@@ -395,8 +361,9 @@ def _scrape_via_subprocess(ignore_seen: bool) -> list[dict[str, Any]]:
 
 def _scrape_direct(ignore_seen: bool) -> list[dict[str, Any]]:
     """Scrape via API: login -> Algolia company IDs -> /companies/fetch."""
-    seen = load_waas_seen()
-    prune_waas_seen(seen)
+    tracker = SeenTracker(WAAS_SEEN_FILE, "jobs")
+    tracker.load()
+    tracker.prune()
 
     companies, _ = _scrape_via_api()
     if not companies:
@@ -415,20 +382,17 @@ def _scrape_direct(ignore_seen: bool) -> list[dict[str, Any]]:
 
     # Dedup
     if not ignore_seen:
-        jobs = [j for j in jobs if j["job_url"] not in seen["jobs"]]
+        jobs = [j for j in jobs if j["job_url"] not in tracker.entries]
         new_urls = [j["job_url"] for j in jobs]
-        seen = mark_waas_seen(seen, new_urls)
-        save_waas_seen(seen)
+        tracker.mark(new_urls)
+        tracker.save()
 
     return jobs
 
 
 # ---------------------------------------------------------------------------
-# Filtering (reuses hn_jobs.py logic)
+# Filtering (uses shared filters module)
 # ---------------------------------------------------------------------------
-
-import hn_jobs
-
 
 def _waas_to_parsed(job: dict) -> dict:
     """Convert a raw WAAS job dict to the parsed format used by HN results.
@@ -436,17 +400,21 @@ def _waas_to_parsed(job: dict) -> dict:
     Required fields: company_name, job_title, job_description, job_url, job_location
     """
     desc = job["job_description"]
+    title = job.get("job_title", "")
     return {
         "id": job["job_url"],
         "time": 0,
         "company": job["company_name"],
+        "role": title,
         "location": job["job_location"],
         "remote": job.get("remote", False),
+        "seniority": estimate_seniority(title, desc),
+        "is_coding": is_coding_job(title, desc),
         "snippet": desc[:300] + ("..." if len(desc) > 300 else ""),
         "full_text": desc,
         "emails": [],
         "email_instructions": [],
-        "job_board_urls": [{"url": job["job_url"], "type": "waas", "title": job["job_title"]}],
+        "job_board_urls": [{"url": job["job_url"], "type": "waas", "title": title}],
         "other_urls": [job["company_url"]] if job.get("company_url") else [],
         "source": "waas",
         "company_yc_batch": job.get("company_yc_batch", ""),
@@ -518,9 +486,9 @@ def _weighted_score(job: dict, matches: dict) -> float:
 
     total = 0.0
     for cat, matched_kws in matches.items():
-        cat_weight = hn_jobs.KEYWORD_CATEGORIES[cat]["weight"]
+        cat_weight = KEYWORD_CATEGORIES[cat]["weight"]
         for kw in matched_kws:
-            pat = hn_jobs._kw_patterns[kw]
+            pat = _kw_patterns[kw]
             best_location_weight = 0.0
 
             # Check title
@@ -547,7 +515,7 @@ def _weighted_score(job: dict, matches: dict) -> float:
 
 
 def filter_waas_jobs(raw_jobs: list[dict], hn_company_names: set[str] | None = None) -> tuple[list[dict], list[dict]]:
-    """Filter WAAS jobs using HN pipeline logic.
+    """Filter WAAS jobs using shared filter pipeline.
 
     Args:
         raw_jobs: List of raw job dicts from scrape_waas_jobs().
@@ -557,6 +525,12 @@ def filter_waas_jobs(raw_jobs: list[dict], hn_company_names: set[str] | None = N
     Returns:
         (results, filtered_out) — each is a list of dicts with parsed/matches/score/source keys.
     """
+    import hn_jobs
+    config = hn_jobs.load_config()
+    filters_cfg = config.get("filters", {})
+    coding_only = filters_cfg.get("coding_only", False)
+    max_seniority = filters_cfg.get("max_seniority")
+
     results = []
     filtered_out = []
 
@@ -580,7 +554,7 @@ def filter_waas_jobs(raw_jobs: list[dict], hn_company_names: set[str] | None = N
 
         # Keyword matching
         try:
-            matches = hn_jobs.match_keywords(text_to_match)
+            matches = match_keywords(text_to_match)
         except Exception:
             logger.warning("match_keywords failed for %s", job.get("job_url", "?"), exc_info=True)
             continue
@@ -590,7 +564,7 @@ def filter_waas_jobs(raw_jobs: list[dict], hn_company_names: set[str] | None = N
 
         # Negative matching
         try:
-            neg_matches = hn_jobs.match_negative(text_to_match)
+            neg_matches = match_negative(text_to_match)
         except Exception:
             logger.warning("match_negative failed for %s", job.get("job_url", "?"), exc_info=True)
             continue
@@ -602,20 +576,15 @@ def filter_waas_jobs(raw_jobs: list[dict], hn_company_names: set[str] | None = N
             logger.warning("_weighted_score failed for %s", job.get("job_url", "?"), exc_info=True)
             continue
 
-        # Location filtering
-        try:
-            outside_us = hn_jobs.is_outside_us(parsed)
-        except Exception:
-            logger.warning("is_outside_us failed for %s", job.get("job_url", "?"), exc_info=True)
-            continue
-
         item = {"parsed": parsed, "matches": matches, "score": score, "source": "waas"}
 
-        if neg_matches:
-            item["filter_reason"] = [f"negative keyword: {kw}" for kw in neg_matches]
-            filtered_out.append(item)
-        elif outside_us:
-            item["filter_reason"] = [f"non-US location: {parsed['location']}"]
+        reasons = apply_filters(
+            parsed, neg_matches,
+            coding_only=coding_only,
+            max_seniority=max_seniority,
+        )
+        if reasons:
+            item["filter_reason"] = reasons
             filtered_out.append(item)
         else:
             results.append(item)

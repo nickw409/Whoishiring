@@ -7,6 +7,7 @@ Python script that scans Hacker News "Who is hiring?" threads, filters posts by 
 - Python 3
 - Dependencies: `requests`, `pyyaml`, `pymupdf`, `anthropic`, `playwright`, `beautifulsoup4`
 - Main scripts: `hn_jobs.py`, `waas.py`
+- Shared filtering: `filters.py` (keyword matching, scoring, seniority, coding classification, location, dedup)
 - Config: `config.yaml` (optional, see `config.yaml.example`)
 
 ## Architecture
@@ -37,6 +38,12 @@ If a post matches positive keywords BUT also matches a negative keyword, it goes
 ### Location Filter
 Non-US jobs are filtered out unless they're marked remote. Uses regex matching against known US and non-US cities/countries. Jobs with no detected location are kept (benefit of the doubt).
 
+### Seniority Filter
+Estimates seniority from job title (staff/senior/lead/junior/intern keywords) and description (experience year requirements). Configurable via `filters.max_seniority` in `config.yaml` — jobs above the specified level go to "Filtered Out". Levels: intern, junior, mid, senior, staff+. Unknown seniority is never filtered (benefit of the doubt).
+
+### Job Type Filter
+Classifies jobs as coding (engineer, developer, SRE, etc.) vs non-coding (product manager, designer, sales, recruiter, etc.). Engineering management is classified as non-coding. Configurable via `filters.coding_only: true` in `config.yaml`. Unknown job types are kept (benefit of the doubt).
+
 ### Claude Ranking
 When a resume is provided (via `config.yaml` or `--resume` flag) and `ANTHROPIC_API_KEY` is set:
 - All filtered results + full resume text + user preferences sent to Claude in one API call
@@ -61,6 +68,8 @@ Target domains: Greenhouse, Lever, Ashby. 0.5s politeness delay between requests
 - `resume` — path to PDF resume for Claude ranking
 - `preferences.remote` — remote preference (e.g., "preferred", "required")
 - `preferences.notes` — free-form text sent to Claude for ranking context
+- `filters.max_seniority` — max seniority level to include (intern/junior/mid/senior/staff+)
+- `filters.coding_only` — if true, filter out non-coding roles
 
 Environment variables:
 - `ANTHROPIC_API_KEY` — for Claude ranking

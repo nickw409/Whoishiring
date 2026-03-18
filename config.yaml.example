@@ -4,3 +4,6 @@ preferences:
   notes: |
     I prefer early-stage startups. Looking to work with Rust or Python.
     Not interested in fintech.
+filters:
+  max_seniority: mid       # intern, junior, mid, senior, staff+ (filter out above this)
+  coding_only: true         # filter out non-coding roles (product, design, sales, management)

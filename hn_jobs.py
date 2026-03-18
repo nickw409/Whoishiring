@@ -19,6 +19,15 @@ import yaml
 import fitz
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from filters import (
+    KEYWORD_CATEGORIES, NEGATIVE_KEYWORDS, SENIORITY_LEVELS, PRUNE_DAYS,
+    _kw_patterns, _neg_patterns,
+    match_keywords, match_negative, score_matches,
+    estimate_seniority, seniority_exceeds,
+    is_coding_job, is_outside_us,
+    apply_filters, SeenTracker,
+)
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -26,54 +35,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 CONFIG_FILE = Path(__file__).parent / "config.yaml"
 SEEN_FILE = Path(__file__).parent / "seen_posts.json"
 RESULTS_DIR = Path(__file__).parent / "results"
-PRUNE_DAYS = 180  # 6 months
 
 HN_API = "https://hacker-news.firebaseio.com/v0"
 HN_SEARCH_API = "https://hn.algolia.com/api/v1"
 HN_USER = "whoishiring"
 THREAD_TITLE_PREFIX = "Ask HN: Who is hiring?"
-
-KEYWORD_CATEGORIES = {
-    "AI tooling": {
-        "weight": 3,
-        "keywords": [
-            "claude code", "copilot", "cursor", "ai-assisted", "ai tools",
-            "ai coding", "agentic", "llm", "ai engineer",
-        ],
-    },
-    "Systems": {
-        "weight": 2,
-        "keywords": [
-            "rust", "cuda", "gpu", "simd", "high-performance", "hpc",
-            "systems programming",
-        ],
-    },
-    "General AI+SWE": {
-        "weight": 1,
-        "keywords": [
-            "machine learning", "tensorflow", "pytorch", "deep learning",
-            "computer vision", "ml engineer", "ai/ml",
-        ],
-    },
-}
-
-NEGATIVE_KEYWORDS = [
-    "staff engineer", "principal engineer", "engineering manager",
-    "director of", "vp of", "10+ years", "15+ years",
-]
-
-# Pre-compile regexes
-_kw_patterns = {}
-for _cat, _info in KEYWORD_CATEGORIES.items():
-    for _kw in _info["keywords"]:
-        # ai/ml needs special handling — escape the slash
-        _escaped = re.escape(_kw)
-        _kw_patterns[_kw] = re.compile(r"\b" + _escaped + r"\b", re.IGNORECASE)
-
-_neg_patterns = {}
-for _kw in NEGATIVE_KEYWORDS:
-    _escaped = re.escape(_kw)
-    _neg_patterns[_kw] = re.compile(r"\b" + _escaped + r"\b", re.IGNORECASE)
 
 # ---------------------------------------------------------------------------
 # Config loading & resume extraction
@@ -94,7 +60,7 @@ def extract_resume_text(path):
 
 
 def load_config(resume_override=None):
-    """Load config from config.yaml. Returns dict with 'resume_text' and 'preferences'."""
+    """Load config from config.yaml. Returns dict with 'resume_text', 'preferences', and 'filters'."""
     config = {}
     if CONFIG_FILE.exists():
         with open(CONFIG_FILE) as f:
@@ -105,41 +71,17 @@ def load_config(resume_override=None):
     if resume_path:
         resume_text = extract_resume_text(resume_path)
 
+    filters = config.get("filters", {})
+
     return {
         "resume_text": resume_text,
         "preferences": config.get("preferences", {}),
+        "filters": {
+            "max_seniority": filters.get("max_seniority"),
+            "coding_only": filters.get("coding_only", False),
+        },
     }
 
-
-# ---------------------------------------------------------------------------
-# Location filtering
-# ---------------------------------------------------------------------------
-
-_NON_US_RE = re.compile(
-    r"\b(london|berlin|munich|hamburg|frankfurt|paris|amsterdam|rotterdam"
-    r"|barcelona|madrid|rome|milan|zurich|vienna|warsaw|prague|stockholm"
-    r"|oslo|copenhagen|helsinki|brussels|lisbon|dublin|budapest|bucharest"
-    r"|toronto|vancouver|montreal|calgary|ottawa"
-    r"|sydney|melbourne|brisbane|perth"
-    r"|singapore|tokyo|osaka|seoul|beijing|shanghai|hong kong|shenzhen"
-    r"|bangalore|bengaluru|mumbai|delhi|hyderabad|pune"
-    r"|tel aviv|istanbul|dubai|abu dhabi"
-    r"|uk|united kingdom|england|scotland|wales"
-    r"|canada|germany|france|spain|italy|netherlands|sweden|norway|denmark"
-    r"|finland|switzerland|austria|belgium|poland|czech|portugal|ireland"
-    r"|australia|new zealand|japan|china|india|south korea"
-    r"|israel|turkey|uae|brazil|mexico|argentina"
-    r"|europe|emea|apac|latam)\b",
-    re.IGNORECASE,
-)
-
-_US_RE = re.compile(
-    r"\b(usa|united states|new york|nyc|san francisco|los angeles|chicago"
-    r"|seattle|boston|austin|denver|atlanta|miami|dallas|houston|portland"
-    r"|phoenix|san diego|minneapolis|detroit|baltimore|washington dc"
-    r"|bay area|silicon valley|,\s*[A-Z]{2})\b",
-    re.IGNORECASE,
-)
 
 # ---------------------------------------------------------------------------
 # HN API helpers
@@ -211,57 +153,13 @@ def fetch_comments(thread):
 
 
 # ---------------------------------------------------------------------------
-# Keyword matching & scoring
-# ---------------------------------------------------------------------------
-
-def match_keywords(text):
-    """Return dict of {category: [matched keywords]} for a comment."""
-    matches = {}
-    for cat, info in KEYWORD_CATEGORIES.items():
-        cat_matches = []
-        for kw in info["keywords"]:
-            if _kw_patterns[kw].search(text):
-                cat_matches.append(kw)
-        if cat_matches:
-            matches[cat] = cat_matches
-    return matches
-
-
-def match_negative(text):
-    """Return list of matched negative keywords."""
-    return [kw for kw, pat in _neg_patterns.items() if pat.search(text)]
-
-
-def is_outside_us(parsed):
-    """Return True if the job is clearly located outside the US and not remote."""
-    if parsed["remote"]:
-        return False
-    location = parsed["location"]
-    if not location:
-        return False
-    if _US_RE.search(location):
-        return False
-    return bool(_NON_US_RE.search(location))
-
-
-def score_matches(matches):
-    """Score based on matched categories (per-category, not per-keyword)."""
-    total = 0
-    for cat in matches:
-        total += KEYWORD_CATEGORIES[cat]["weight"]
-    return total
-
-
-# ---------------------------------------------------------------------------
 # Comment parsing
 # ---------------------------------------------------------------------------
 
 def strip_html(text):
     """Strip HTML tags and decode entities from HN comment text."""
-    # HN uses <p> for paragraph breaks
     text = re.sub(r"<p>", "\n\n", text)
     text = re.sub(r"<br\s*/?>", "\n", text)
-    # pull out links before stripping
     text = re.sub(r"<[^>]+>", "", text)
     return html.unescape(text).strip()
 
@@ -269,10 +167,8 @@ def strip_html(text):
 def extract_urls(html_text):
     """Extract URLs from href attributes and plain text."""
     urls = set()
-    # from href attributes (unescape HTML entities in URLs)
     for m in re.finditer(r'href="([^"]+)"', html_text):
         urls.add(html.unescape(m.group(1)))
-    # from plain text (after stripping tags)
     plain = strip_html(html_text)
     for m in re.finditer(r'https?://[^\s<>"\')\]]+', plain):
         urls.add(m.group(0).rstrip(".,;:"))
@@ -317,21 +213,27 @@ def parse_comment(comment):
 
     # First line is typically "Company | Role | Location | Remote/Onsite | Salary"
     company = ""
+    role = ""
     location = ""
     remote = False
-    _skip_patterns = re.compile(
-        r"^(remote|onsite|on-site|hybrid|full.time|part.time|contract|intern"
-        r"|visa|no visa|relocation|\$[\d,]+|http|www\.|engineer|developer"
-        r"|manager|designer|scientist|analyst|lead|senior|junior|founding"
-        r"|backend|frontend|fullstack|full stack|devops|sre|platform"
-        r"|mobile|ios|android|data|ml |ai |research)",
+    _role_hint = re.compile(
+        r"(engineer|developer|programmer|architect|sre|devops|swe"
+        r"|designer|manager|scientist|analyst|lead|senior|junior|founding"
+        r"|backend|frontend|fullstack|full.stack|platform|infrastructure"
+        r"|product|marketing|sales|recruiter|operations"
+        r"|mobile|ios|android|data|ml |ai |research|intern)",
         re.IGNORECASE,
     )
     _location_hint = re.compile(
         r"(remote|nyc|sf|san francisco|new york|london|berlin|austin|seattle"
         r"|boston|chicago|denver|toronto|vancouver|paris|amsterdam|singapore"
         r"|bay area|usa|eu\b|uk\b|canada|germany|india|japan"
-        r"|,\s*[A-Z]{2}\b)",  # "City, ST" pattern
+        r"|,\s*[A-Z]{2}\b)",
+        re.IGNORECASE,
+    )
+    _non_location = re.compile(
+        r"^(remote|onsite|on-site|hybrid|full.time|part.time|contract"
+        r"|visa|no visa|relocation|\$[\d,]+|http|www\.)",
         re.IGNORECASE,
     )
     if lines:
@@ -343,9 +245,11 @@ def parse_comment(comment):
             lower = part.lower()
             if "remote" in lower:
                 remote = True
-            if not location and _location_hint.search(part) and not part.startswith("$"):
+            if not role and _role_hint.search(part) and not part.startswith("$"):
+                role = part
+            elif not location and _location_hint.search(part) and not part.startswith("$"):
                 location = part
-            elif not location and not _skip_patterns.match(lower):
+            elif not location and not _non_location.match(lower) and not _role_hint.search(part):
                 location = part
 
     urls = extract_urls(raw)
@@ -363,12 +267,18 @@ def parse_comment(comment):
 
     snippet = plain[:300] + ("..." if len(plain) > 300 else "")
 
+    seniority = estimate_seniority(role, plain)
+    coding = is_coding_job(role, plain)
+
     return {
         "id": comment["id"],
         "time": comment.get("time", 0),
         "company": company,
+        "role": role,
         "location": location,
         "remote": remote,
+        "seniority": seniority,
+        "is_coding": coding,
         "snippet": snippet,
         "full_text": plain,
         "emails": emails,
@@ -442,46 +352,73 @@ def scrape_job_boards(parsed):
 
 
 # ---------------------------------------------------------------------------
-# Deduplication
+# Process threads (shared between main() and MCP server)
 # ---------------------------------------------------------------------------
 
-def load_seen():
-    """Load seen post IDs from disk."""
-    if SEEN_FILE.exists():
-        try:
-            data = json.loads(SEEN_FILE.read_text())
-            return data
-        except (json.JSONDecodeError, KeyError):
-            return {"posts": {}}
-    return {"posts": {}}
+def process_threads(threads, seen_tracker, config_filters, scrape=True):
+    """Process HN threads through the filter pipeline.
 
+    Args:
+        threads: List of HN thread dicts.
+        seen_tracker: SeenTracker instance, or None to skip dedup.
+        config_filters: Dict with 'coding_only' and 'max_seniority' keys.
+        scrape: Whether to scrape job board URLs.
 
-def save_seen(seen):
-    """Save seen post IDs to disk."""
-    SEEN_FILE.write_text(json.dumps(seen, indent=2))
+    Returns:
+        (results, filtered_out, all_seen_ids)
+    """
+    coding_only = config_filters.get("coding_only", False)
+    max_seniority = config_filters.get("max_seniority")
 
+    results = []
+    filtered_out = []
+    all_seen_ids = []
 
-def prune_seen(seen):
-    """Remove entries older than PRUNE_DAYS."""
-    cutoff = time.time() - (PRUNE_DAYS * 86400)
-    seen["posts"] = {
-        pid: ts for pid, ts in seen["posts"].items()
-        if ts > cutoff
-    }
-    return seen
+    for thread in threads:
+        comments = fetch_comments(thread)
 
+        for comment in comments:
+            cid = str(comment["id"])
 
-def mark_seen(seen, post_ids):
-    """Mark post IDs as seen."""
-    now = time.time()
-    for pid in post_ids:
-        seen["posts"][str(pid)] = now
-    return seen
+            if seen_tracker and seen_tracker.is_seen(cid):
+                continue
 
+            all_seen_ids.append(cid)
+            raw_text = strip_html(comment.get("text", ""))
 
-def is_first_run(seen):
-    """Check if this is the first run (no seen posts)."""
-    return len(seen.get("posts", {})) == 0
+            matches = match_keywords(raw_text)
+            if not matches:
+                continue
+
+            neg = match_negative(raw_text)
+            score = score_matches(matches)
+            parsed = parse_comment(comment)
+
+            if scrape:
+                scrape_job_boards(parsed)
+
+            item = {
+                "parsed": parsed,
+                "matches": matches,
+                "score": score,
+                "thread_title": thread.get("title", ""),
+            }
+
+            reasons = apply_filters(
+                parsed, neg,
+                coding_only=coding_only,
+                max_seniority=max_seniority,
+            )
+            if reasons:
+                item["neg_matches"] = reasons
+                filtered_out.append(item)
+            else:
+                results.append(item)
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    filtered_out.sort(key=lambda x: x["score"], reverse=True)
+
+    return results, filtered_out, all_seen_ids
 
 
 # ---------------------------------------------------------------------------
@@ -692,7 +629,7 @@ def build_email_html(results, filtered_out, thread_titles):
     if filtered_out:
         filtered_html = """
         <div style="margin-top:32px;border-top:2px solid #ffcdd2;padding-top:16px">
-            <h2 style="color:#c62828;font-size:1.1em">Filtered Out (negative keyword match)</h2>
+            <h2 style="color:#c62828;font-size:1.1em">Filtered Out</h2>
         """
         for item in filtered_out:
             filtered_html += format_post_html(item["parsed"], item["matches"], item["neg_matches"])
@@ -811,8 +748,9 @@ def main():
             sys.exit(1)
 
     # Load dedup state
-    seen = load_seen()
-    first_run = is_first_run(seen)
+    tracker = SeenTracker(SEEN_FILE, "posts")
+    tracker.load()
+    first_run = tracker.is_empty()
 
     # Find threads
     num_threads = 3 if first_run else 1
@@ -827,56 +765,10 @@ def main():
         print(f"  Found: {t}")
 
     # Process comments
-    results = []
-    filtered_out = []
-    all_seen_ids = []
-
-    for thread in threads:
-        print(f"\nFetching comments from: {thread.get('title', 'Unknown')}...")
-        comments = fetch_comments(thread)
-        print(f"  {len(comments)} top-level comments")
-
-        for comment in comments:
-            cid = str(comment["id"])
-
-            # Dedup
-            if cid in seen.get("posts", {}):
-                continue
-
-            all_seen_ids.append(cid)
-            raw_text = strip_html(comment.get("text", ""))
-
-            # Match keywords
-            matches = match_keywords(raw_text)
-            if not matches:
-                continue
-
-            neg = match_negative(raw_text)
-            score = score_matches(matches)
-            parsed = parse_comment(comment)
-
-            # Scrape job boards
-            scrape_job_boards(parsed)
-
-            item = {
-                "parsed": parsed,
-                "matches": matches,
-                "score": score,
-                "thread_title": thread.get("title", ""),
-            }
-
-            if neg:
-                item["neg_matches"] = neg
-                filtered_out.append(item)
-            elif is_outside_us(parsed):
-                item["neg_matches"] = ["non-US location"]
-                filtered_out.append(item)
-            else:
-                results.append(item)
-
-    # Sort by score descending
-    results.sort(key=lambda x: x["score"], reverse=True)
-    filtered_out.sort(key=lambda x: x["score"], reverse=True)
+    print(f"\nFetching comments...")
+    results, filtered_out, all_seen_ids = process_threads(
+        threads, tracker, config["filters"],
+    )
 
     print(f"\n{len(results)} matching posts, {len(filtered_out)} filtered out")
 
@@ -910,8 +802,11 @@ def main():
             {
                 "id": r["parsed"]["id"],
                 "company": r["parsed"]["company"],
+                "role": r["parsed"].get("role", ""),
                 "location": r["parsed"]["location"],
                 "remote": r["parsed"]["remote"],
+                "seniority": r["parsed"].get("seniority", "unknown"),
+                "is_coding": r["parsed"].get("is_coding", True),
                 "score": r["score"],
                 "matched_categories": list(r["matches"].keys()),
                 "matched_keywords": [kw for kws in r["matches"].values() for kw in kws],
@@ -927,9 +822,9 @@ def main():
     print(f"Results saved to {json_path}")
 
     # Update dedup
-    mark_seen(seen, all_seen_ids)
-    prune_seen(seen)
-    save_seen(seen)
+    tracker.mark(all_seen_ids)
+    tracker.prune()
+    tracker.save()
     print(f"Marked {len(all_seen_ids)} posts as seen")
 
 
