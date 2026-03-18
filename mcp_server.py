@@ -2,6 +2,7 @@
 """MCP server for HN Who's Hiring job scanner."""
 
 import json
+import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -33,10 +34,11 @@ def _active_filters() -> dict:
 
 
 _PROJECT_DIR = Path(__file__).parent
-TRACKED_JOBS_FILE = _PROJECT_DIR / "tracked_jobs.json"
-BACKLOG_JOBS_FILE = _PROJECT_DIR / "backlog_jobs.json"
-APPLIED_JOBS_FILE = _PROJECT_DIR / "applied_jobs.json"
-DISMISSED_JOBS_FILE = _PROJECT_DIR / "dismissed_jobs.json"
+_TRACKING_DIR = Path(os.environ.get("TRACKING_DIR", str(_PROJECT_DIR)))
+TRACKED_JOBS_FILE = _TRACKING_DIR / "tracked_jobs.json"
+BACKLOG_JOBS_FILE = _TRACKING_DIR / "backlog_jobs.json"
+APPLIED_JOBS_FILE = _TRACKING_DIR / "applied_jobs.json"
+DISMISSED_JOBS_FILE = _TRACKING_DIR / "dismissed_jobs.json"
 
 DEFAULT_MAX_TRACKED = 20
 
