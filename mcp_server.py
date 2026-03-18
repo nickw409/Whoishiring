@@ -5,6 +5,7 @@ import json
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date
 from pathlib import Path
 
 # Add project dir to path so we can import from hn_jobs
@@ -29,6 +30,57 @@ def _active_filters() -> dict:
     if f.get("coding_only"):
         active["coding_only"] = True
     return active
+
+
+TRACKED_JOBS_FILE = Path(__file__).parent / "tracked_jobs.json"
+
+
+def _load_tracked() -> dict:
+    """Load tracked_jobs.json. Returns empty dict if missing or corrupt."""
+    if TRACKED_JOBS_FILE.exists():
+        try:
+            return json.loads(TRACKED_JOBS_FILE.read_text())
+        except (json.JSONDecodeError, KeyError):
+            return {}
+    return {}
+
+
+def _save_tracked(data: dict) -> None:
+    """Write tracked_jobs.json atomically (read-modify-write)."""
+    TRACKED_JOBS_FILE.write_text(json.dumps(data, indent=2))
+
+
+def _track_waas_results(formatted: list[dict]) -> int:
+    """Append new WAAS results to tracked_jobs.json. Returns count of newly tracked jobs."""
+    tracked = _load_tracked()
+    added = 0
+    today = date.today().isoformat()
+
+    for r in formatted:
+        job_url = r.get("job_url", "")
+        if not job_url or job_url in tracked:
+            continue
+
+        tracked[job_url] = {
+            "company": r.get("company", ""),
+            "yc_batch": r.get("company_yc_batch", ""),
+            "company_size": r.get("company_size", ""),
+            "job_title": r.get("job_title", ""),
+            "seniority": r.get("seniority", "unknown"),
+            "salary_range": r.get("salary_range", ""),
+            "location": r.get("location", ""),
+            "remote": r.get("remote", False),
+            "other_roles": r.get("other_roles", []),
+            "status": "open",
+            "date_added": today,
+            "date_applied": None,
+            "analysis": None,
+        }
+        added += 1
+
+    if added:
+        _save_tracked(tracked)
+    return added
 
 
 def _scan_hn(months: int, ignore_seen: bool) -> tuple[list[dict], list[dict], list[str]]:
@@ -310,6 +362,9 @@ def scan_waas(ignore_seen: bool = False, group_by_company: bool = True) -> str:
 
     formatted = formatted[:WAAS_MAX_RESULTS]
 
+    # Track new jobs (side effect — does not change the response)
+    newly_tracked = _track_waas_results(formatted)
+
     active = _active_filters()
     response = {
         "source": "waas",
@@ -317,6 +372,7 @@ def scan_waas(ignore_seen: bool = False, group_by_company: bool = True) -> str:
         "total_all_roles": total_all_roles,
         "total_filtered": len(filtered_out),
         "grouped_by_company": group_by_company,
+        "newly_tracked": newly_tracked,
         "results": formatted,
     }
     if active:
@@ -585,6 +641,143 @@ def update_config(
         "status": "updated",
         "config": config,
     }, indent=2, default=str)
+
+
+# ---------------------------------------------------------------------------
+# Job tracking tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_tracked_jobs() -> str:
+    """Return the full contents of tracked_jobs.json.
+
+    Each entry is keyed by WAAS job URL and contains: company, yc_batch,
+    company_size, job_title, seniority, salary_range, location, remote,
+    other_roles, status (open/applied/dismissed), date_added, date_applied,
+    and analysis (null until populated via update_job_analysis).
+
+    Use this to find jobs needing analysis (analysis is null) or to review
+    the current state of all tracked jobs.
+    """
+    return json.dumps(_load_tracked(), indent=2)
+
+
+@mcp.tool()
+def update_job_analysis(job_url: str, fit_explanation: str, odds: str,
+                        odds_reasoning: str, salary_vs_col: str) -> str:
+    """Write an analysis for a tracked job. Does not overwrite existing analysis.
+
+    Args:
+        job_url: The WAAS job URL to update.
+        fit_explanation: How the user's resume connects to this role.
+        odds: Estimated chance of getting the job — "low", "medium", or "high".
+        odds_reasoning: Why the odds are what they are.
+        salary_vs_col: Salary compared to cost of living for the job's location.
+    """
+    tracked = _load_tracked()
+    if job_url not in tracked:
+        return json.dumps({"error": f"Job not tracked: {job_url}"})
+
+    if tracked[job_url]["analysis"] is not None:
+        return json.dumps({"error": "Analysis already exists. Will not overwrite."})
+
+    if odds not in ("low", "medium", "high"):
+        return json.dumps({"error": f"Invalid odds value: {odds}. Must be low, medium, or high."})
+
+    tracked[job_url]["analysis"] = {
+        "fit_explanation": fit_explanation,
+        "odds": odds,
+        "odds_reasoning": odds_reasoning,
+        "salary_vs_col": salary_vs_col,
+    }
+    _save_tracked(tracked)
+    return json.dumps({"status": "updated", "job_url": job_url})
+
+
+@mcp.tool()
+def mark_applied(job_url: str) -> str:
+    """Set a tracked job's status to "applied" and record today's date.
+
+    Args:
+        job_url: The WAAS job URL to mark as applied.
+    """
+    tracked = _load_tracked()
+    if job_url not in tracked:
+        return json.dumps({"error": f"Job not tracked: {job_url}"})
+    tracked[job_url]["status"] = "applied"
+    tracked[job_url]["date_applied"] = date.today().isoformat()
+    _save_tracked(tracked)
+    return json.dumps({"status": "applied", "job_url": job_url})
+
+
+@mcp.tool()
+def mark_dismissed(job_url: str) -> str:
+    """Set a tracked job's status to "dismissed".
+
+    Args:
+        job_url: The WAAS job URL to dismiss.
+    """
+    tracked = _load_tracked()
+    if job_url not in tracked:
+        return json.dumps({"error": f"Job not tracked: {job_url}"})
+    tracked[job_url]["status"] = "dismissed"
+    _save_tracked(tracked)
+    return json.dumps({"status": "dismissed", "job_url": job_url})
+
+
+@mcp.tool()
+def mark_open(job_url: str) -> str:
+    """Revert a tracked job's status to "open" and clear date_applied.
+
+    Args:
+        job_url: The WAAS job URL to revert to open.
+    """
+    tracked = _load_tracked()
+    if job_url not in tracked:
+        return json.dumps({"error": f"Job not tracked: {job_url}"})
+    tracked[job_url]["status"] = "open"
+    tracked[job_url]["date_applied"] = None
+    _save_tracked(tracked)
+    return json.dumps({"status": "open", "job_url": job_url})
+
+
+@mcp.tool()
+def validate_tracked_jobs() -> str:
+    """Check all "open" tracked jobs and remove any whose listings are no longer live.
+
+    Hits each open job's URL to verify the listing still exists. Removes dead
+    listings from tracked_jobs.json entirely. Skips applied and dismissed jobs.
+
+    Returns a summary with validated count, removed count, and removed URLs.
+    Run this before scan_waas to clean out stale listings.
+    """
+    import requests
+
+    tracked = _load_tracked()
+    open_urls = [url for url, entry in tracked.items() if entry.get("status") == "open"]
+
+    removed = []
+    for url in open_urls:
+        try:
+            resp = requests.head(url, timeout=10, allow_redirects=True, headers={
+                "User-Agent": "Mozilla/5.0 (compatible; HNJobScanner/1.0)"
+            })
+            if resp.status_code >= 400:
+                removed.append(url)
+        except requests.RequestException:
+            removed.append(url)
+
+    for url in removed:
+        del tracked[url]
+
+    if removed:
+        _save_tracked(tracked)
+
+    return json.dumps({
+        "validated": len(open_urls) - len(removed),
+        "removed": len(removed),
+        "removed_jobs": removed,
+    }, indent=2)
 
 
 @mcp.prompt()

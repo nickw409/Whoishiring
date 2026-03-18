@@ -106,6 +106,20 @@ Exposes the scan pipeline to Claude Desktop via the Model Context Protocol (stdi
 - `get_resume()` — extracts resume text from configured PDF
 - `get_preferences()` — returns preferences from config.yaml
 - `get_latest_results()` — returns most recent saved results JSON
+- `get_tracked_jobs()` — returns full contents of `tracked_jobs.json`
+- `update_job_analysis(job_url, fit_explanation, odds, odds_reasoning, salary_vs_col)` — writes analysis for a tracked job (will not overwrite existing)
+- `mark_applied(job_url)` — sets status to "applied", records date
+- `mark_dismissed(job_url)` — sets status to "dismissed"
+- `mark_open(job_url)` — reverts status to "open", clears date_applied
+- `validate_tracked_jobs()` — checks open jobs are still live, removes dead listings
+
+### Job Tracking (`tracked_jobs.json`)
+Persistent JSON file keyed by WAAS job URL. Each entry has: company, yc_batch, company_size, job_title, seniority, salary_range, location, remote, other_roles, status (open/applied/dismissed), date_added, date_applied, analysis.
+
+- `scan_waas` automatically appends new jobs with status "open" and null analysis
+- `validate_tracked_jobs` removes dead listings (only checks "open" status)
+- `update_job_analysis` fills in the analysis object (never overwrites existing)
+- Daily workflow: validate → scan → analyze unanalyzed → display in React artifact
 
 ### Prompts
 Server registers MCP prompts (`find_jobs`, `rerank_results`, `scan_overview`, `backfill`) but Claude Desktop does not surface them in its UI as of March 2026. They are returned via `prompts/list` but ignored by the client.

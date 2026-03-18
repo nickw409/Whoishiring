@@ -510,3 +510,245 @@ class TestWaasIgnoreSeenMode:
         monkeypatch.setattr("waas.SeenTracker", MockTracker)
         jobs = _scrape_direct(ignore_seen=True)
         assert len(jobs) == 1
+
+
+# ---------------------------------------------------------------------------
+# Job tracking: tracked_jobs.json CRUD
+# ---------------------------------------------------------------------------
+
+class TestTrackedJobsHelpers:
+    def test_load_missing_file(self, tmp_path):
+        with patch.object(mcp_server, "TRACKED_JOBS_FILE", tmp_path / "nope.json"):
+            assert mcp_server._load_tracked() == {}
+
+    def test_load_corrupt_file(self, tmp_path):
+        f = tmp_path / "tracked.json"
+        f.write_text("not json{{{")
+        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f):
+            assert mcp_server._load_tracked() == {}
+
+    def test_save_and_load_roundtrip(self, tmp_path):
+        f = tmp_path / "tracked.json"
+        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f):
+            mcp_server._save_tracked({"https://waas.com/1": {"status": "open"}})
+            data = mcp_server._load_tracked()
+        assert "https://waas.com/1" in data
+
+    def test_track_waas_results_adds_new(self, tmp_path):
+        f = tmp_path / "tracked.json"
+        f.write_text("{}")
+        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f):
+            count = mcp_server._track_waas_results([{
+                "job_url": "https://waas.com/jobs/1",
+                "company": "TestCo",
+                "company_yc_batch": "S24",
+                "company_size": "10 people",
+                "job_title": "Engineer",
+                "seniority": "mid",
+                "salary_range": "$120k",
+                "location": "SF",
+                "remote": False,
+            }])
+            data = mcp_server._load_tracked()
+        assert count == 1
+        entry = data["https://waas.com/jobs/1"]
+        assert entry["status"] == "open"
+        assert entry["analysis"] is None
+        assert entry["date_applied"] is None
+
+    def test_track_waas_results_skips_existing(self, tmp_path):
+        f = tmp_path / "tracked.json"
+        f.write_text(json.dumps({"https://waas.com/jobs/1": {"status": "applied"}}))
+        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f):
+            count = mcp_server._track_waas_results([{
+                "job_url": "https://waas.com/jobs/1",
+                "company": "TestCo",
+            }])
+            data = mcp_server._load_tracked()
+        assert count == 0
+        assert data["https://waas.com/jobs/1"]["status"] == "applied"
+
+
+class TestGetTrackedJobs:
+    def test_returns_tracked_data(self, tmp_path):
+        f = tmp_path / "tracked.json"
+        f.write_text(json.dumps({"https://waas.com/1": {"status": "open"}}))
+        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f):
+            result = json.loads(mcp_server.get_tracked_jobs())
+        assert "https://waas.com/1" in result
+
+    def test_empty_file(self, tmp_path):
+        with patch.object(mcp_server, "TRACKED_JOBS_FILE", tmp_path / "nope.json"):
+            result = json.loads(mcp_server.get_tracked_jobs())
+        assert result == {}
+
+
+class TestUpdateJobAnalysis:
+    def test_writes_analysis(self, tmp_path):
+        f = tmp_path / "tracked.json"
+        f.write_text(json.dumps({
+            "https://waas.com/1": {"status": "open", "analysis": None}
+        }))
+        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f):
+            result = json.loads(mcp_server.update_job_analysis(
+                "https://waas.com/1", "Good fit", "high", "Strong match", "$120k vs $80k COL"
+            ))
+            data = mcp_server._load_tracked()
+        assert result["status"] == "updated"
+        analysis = data["https://waas.com/1"]["analysis"]
+        assert analysis["fit_explanation"] == "Good fit"
+        assert analysis["odds"] == "high"
+
+    def test_rejects_overwrite(self, tmp_path):
+        f = tmp_path / "tracked.json"
+        f.write_text(json.dumps({
+            "https://waas.com/1": {"status": "open", "analysis": {"odds": "low"}}
+        }))
+        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f):
+            result = json.loads(mcp_server.update_job_analysis(
+                "https://waas.com/1", "New", "high", "New", "New"
+            ))
+        assert "error" in result
+        assert "overwrite" in result["error"].lower()
+
+    def test_rejects_unknown_job(self, tmp_path):
+        f = tmp_path / "tracked.json"
+        f.write_text("{}")
+        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f):
+            result = json.loads(mcp_server.update_job_analysis(
+                "https://waas.com/nope", "X", "high", "X", "X"
+            ))
+        assert "error" in result
+
+    def test_rejects_invalid_odds(self, tmp_path):
+        f = tmp_path / "tracked.json"
+        f.write_text(json.dumps({
+            "https://waas.com/1": {"status": "open", "analysis": None}
+        }))
+        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f):
+            result = json.loads(mcp_server.update_job_analysis(
+                "https://waas.com/1", "X", "maybe", "X", "X"
+            ))
+        assert "error" in result
+
+
+class TestMarkStatus:
+    def _setup(self, tmp_path):
+        f = tmp_path / "tracked.json"
+        f.write_text(json.dumps({
+            "https://waas.com/1": {"status": "open", "date_applied": None}
+        }))
+        return f
+
+    def test_mark_applied(self, tmp_path):
+        f = self._setup(tmp_path)
+        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f):
+            result = json.loads(mcp_server.mark_applied("https://waas.com/1"))
+            data = mcp_server._load_tracked()
+        assert result["status"] == "applied"
+        assert data["https://waas.com/1"]["status"] == "applied"
+        assert data["https://waas.com/1"]["date_applied"] is not None
+
+    def test_mark_dismissed(self, tmp_path):
+        f = self._setup(tmp_path)
+        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f):
+            result = json.loads(mcp_server.mark_dismissed("https://waas.com/1"))
+            data = mcp_server._load_tracked()
+        assert result["status"] == "dismissed"
+        assert data["https://waas.com/1"]["status"] == "dismissed"
+
+    def test_mark_open_reverts(self, tmp_path):
+        f = tmp_path / "tracked.json"
+        f.write_text(json.dumps({
+            "https://waas.com/1": {"status": "applied", "date_applied": "2026-03-18"}
+        }))
+        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f):
+            result = json.loads(mcp_server.mark_open("https://waas.com/1"))
+            data = mcp_server._load_tracked()
+        assert result["status"] == "open"
+        assert data["https://waas.com/1"]["status"] == "open"
+        assert data["https://waas.com/1"]["date_applied"] is None
+
+    def test_mark_unknown_job_errors(self, tmp_path):
+        f = tmp_path / "tracked.json"
+        f.write_text("{}")
+        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f):
+            result = json.loads(mcp_server.mark_applied("https://waas.com/nope"))
+        assert "error" in result
+
+
+class TestValidateTrackedJobs:
+    def test_removes_dead_listings(self, tmp_path):
+        f = tmp_path / "tracked.json"
+        f.write_text(json.dumps({
+            "https://waas.com/alive": {"status": "open"},
+            "https://waas.com/dead": {"status": "open"},
+        }))
+
+        def mock_head(url, **kwargs):
+            resp = MagicMock()
+            resp.status_code = 200 if "alive" in url else 404
+            return resp
+
+        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f), \
+             patch("requests.head", side_effect=mock_head):
+            result = json.loads(mcp_server.validate_tracked_jobs())
+            data = mcp_server._load_tracked()
+
+        assert result["validated"] == 1
+        assert result["removed"] == 1
+        assert "https://waas.com/dead" in result["removed_jobs"]
+        assert "https://waas.com/alive" in data
+        assert "https://waas.com/dead" not in data
+
+    def test_skips_applied_and_dismissed(self, tmp_path):
+        f = tmp_path / "tracked.json"
+        f.write_text(json.dumps({
+            "https://waas.com/applied": {"status": "applied"},
+            "https://waas.com/dismissed": {"status": "dismissed"},
+        }))
+        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f), \
+             patch("requests.head") as mock_head:
+            result = json.loads(mcp_server.validate_tracked_jobs())
+        mock_head.assert_not_called()
+        assert result["validated"] == 0
+        assert result["removed"] == 0
+
+    def test_network_error_removes_job(self, tmp_path):
+        import requests
+        f = tmp_path / "tracked.json"
+        f.write_text(json.dumps({
+            "https://waas.com/timeout": {"status": "open"},
+        }))
+        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f), \
+             patch("requests.head", side_effect=requests.ConnectionError):
+            result = json.loads(mcp_server.validate_tracked_jobs())
+        assert result["removed"] == 1
+
+
+class TestScanWaasTracking:
+    def test_scan_waas_tracks_new_jobs(self, tmp_path):
+        """scan_waas should append new jobs to tracked_jobs.json."""
+        f = tmp_path / "tracked.json"
+        f.write_text("{}")
+
+        mock_results = [{
+            "parsed": {
+                "company": "TestCo", "location": "SF", "remote": False,
+                "full_text": "Build with LLM tools",
+                "job_board_urls": [{"url": "https://waas.com/jobs/1", "type": "waas", "title": "Engineer"}],
+                "salary_range": "$120k", "company_yc_batch": "S24", "company_size": "10",
+                "seniority": "mid", "is_coding": True,
+            },
+            "matches": {"AI tooling": ["llm"]},
+            "score": 3.0,
+            "source": "waas",
+        }]
+
+        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f), \
+             patch("waas.scan_and_filter_waas", return_value=(mock_results, [])):
+            result = json.loads(mcp_server.scan_waas())
+
+        assert result["newly_tracked"] == 1
+        data = json.loads(f.read_text())
+        assert "https://waas.com/jobs/1" in data
