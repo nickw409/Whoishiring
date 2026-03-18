@@ -730,7 +730,7 @@ class TestValidateTrackedJobs:
             data = mcp_server._load_tracked()
 
         assert result["validated"] == 1
-        assert result["removed"] == 1
+        assert result["removed_tracked"] == 1
         assert "https://waas.com/dead" in result["removed_jobs"]
         assert "https://waas.com/alive" in data
         assert "https://waas.com/dead" not in data
@@ -765,7 +765,7 @@ class TestValidateTrackedJobs:
         with _patch_all_tracking_files(tmp_path), \
              patch("requests.head", side_effect=requests.ConnectionError):
             result = json.loads(mcp_server.validate_tracked_jobs())
-        assert result["removed"] == 1
+        assert result["removed_tracked"] == 1
 
 
 class TestScanWaasTracking:

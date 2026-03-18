@@ -979,10 +979,11 @@ def mark_open(job_url: str) -> str:
 
 @mcp.tool()
 def validate_tracked_jobs() -> str:
-    """Check all tracked jobs and remove any whose listings are no longer live.
+    """Check tracked and dismissed jobs, remove any whose listings are no longer live.
 
     Hits each job's URL to verify the listing still exists. Removes dead
-    listings from tracked_jobs.json entirely, then backfills from the backlog.
+    listings from tracked_jobs.json and dismissed_jobs.json. Backfills
+    tracked from backlog after removing. Skips applied jobs (permanent).
 
     Returns a summary with validated count, removed count, and removed URLs.
     Run this before scan_waas to clean out stale listings.
@@ -990,34 +991,47 @@ def validate_tracked_jobs() -> str:
     import requests
 
     tracked = _load_tracked()
-    urls_to_check = list(tracked.keys())
+    dismissed = _load_dismissed()
 
-    removed = []
-    for url in urls_to_check:
-        try:
-            resp = requests.head(url, timeout=10, allow_redirects=True, headers={
-                "User-Agent": "Mozilla/5.0 (compatible; HNJobScanner/1.0)"
-            })
-            if resp.status_code >= 400:
-                removed.append(url)
-        except requests.RequestException:
-            removed.append(url)
+    def _check_urls(jobs: dict) -> list[str]:
+        dead = []
+        for url in list(jobs.keys()):
+            try:
+                resp = requests.head(url, timeout=10, allow_redirects=True, headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; HNJobScanner/1.0)"
+                })
+                if resp.status_code >= 400:
+                    dead.append(url)
+            except requests.RequestException:
+                dead.append(url)
+        return dead
 
-    for url in removed:
+    removed_tracked = _check_urls(tracked)
+    removed_dismissed = _check_urls(dismissed)
+
+    for url in removed_tracked:
         del tracked[url]
+    for url in removed_dismissed:
+        del dismissed[url]
 
     # Backfill from backlog
     backlog = _load_backlog()
     promoted = _backfill_tracked(tracked, backlog, _max_tracked())
 
     _save_tracked(tracked)
-    if removed or promoted:
+    if removed_dismissed:
+        _save_dismissed(dismissed)
+    if removed_tracked or promoted:
         _save_backlog(backlog)
 
+    all_removed = removed_tracked + removed_dismissed
+    total_checked = len(tracked) + len(removed_tracked) + len(dismissed) + len(removed_dismissed)
     return json.dumps({
-        "validated": len(urls_to_check) - len(removed),
-        "removed": len(removed),
-        "removed_jobs": removed,
+        "checked": total_checked,
+        "validated": total_checked - len(all_removed),
+        "removed_tracked": len(removed_tracked),
+        "removed_dismissed": len(removed_dismissed),
+        "removed_jobs": all_removed,
         "backfilled": len(promoted),
     }, indent=2)
 
