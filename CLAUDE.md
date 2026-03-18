@@ -106,19 +106,26 @@ Exposes the scan pipeline to Claude Desktop via the Model Context Protocol (stdi
 - `get_resume()` — extracts resume text from configured PDF
 - `get_preferences()` — returns preferences from config.yaml
 - `get_latest_results()` — returns most recent saved results JSON
-- `get_tracked_jobs()` — returns full contents of `tracked_jobs.json`
+- `get_tracked_jobs()` — returns tracked jobs (active analysis pipeline, max N)
+- `get_applied_jobs()` — returns jobs marked as applied
 - `update_job_analysis(job_url, fit_explanation, odds, odds_reasoning, salary_vs_col)` — writes analysis for a tracked job (will not overwrite existing)
-- `mark_applied(job_url)` — sets status to "applied", records date
-- `mark_dismissed(job_url)` — sets status to "dismissed"
-- `mark_open(job_url)` — reverts status to "open", clears date_applied
-- `validate_tracked_jobs()` — checks open jobs are still live, removes dead listings
+- `mark_applied(job_url)` — moves job from tracked → applied_jobs.json, backfills from backlog
+- `mark_dismissed(job_url)` — moves job from tracked → dismissed_jobs.json, backfills from backlog
+- `mark_open(job_url)` — moves job from applied/dismissed back to tracked (demotes lowest-score if at cap)
+- `validate_tracked_jobs()` — checks tracked jobs are still live, removes dead, backfills from backlog
 
-### Job Tracking (`tracked_jobs.json`)
-Persistent JSON file keyed by WAAS job URL. Each entry has: company, yc_batch, company_size, job_title, seniority, salary_range, location, remote, other_roles, status (open/applied/dismissed), date_added, date_applied, analysis.
+### Job Tracking
+Four JSON files keyed by WAAS job URL:
+- `tracked_jobs.json` — active pipeline, max N jobs (default 20, configurable via `tracking.max_tracked` in config.yaml). All entries are open status.
+- `backlog_jobs.json` — overflow jobs that passed filters but didn't make the top N cut. Ranked by score for promotion.
+- `applied_jobs.json` — jobs moved here by `mark_applied`
+- `dismissed_jobs.json` — jobs moved here by `mark_dismissed`
 
-- `scan_waas` automatically appends new jobs with status "open" and null analysis
-- `validate_tracked_jobs` removes dead listings (only checks "open" status)
-- `update_job_analysis` fills in the analysis object (never overwrites existing)
+Each entry has: company, yc_batch, company_size, job_title, seniority, salary_range, location, remote, other_roles, score, status, date_added, date_applied, analysis.
+
+- `scan_waas` ranks new jobs by score, fills tracked up to N, rest go to backlog
+- `mark_applied`/`mark_dismissed` free a tracked slot; top backlog job is promoted
+- `validate_tracked_jobs` removes dead listings, backfills from backlog
 - Daily workflow: validate → scan → analyze unanalyzed → display in React artifact
 
 ### Prompts

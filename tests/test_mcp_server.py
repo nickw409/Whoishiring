@@ -537,8 +537,11 @@ class TestTrackedJobsHelpers:
     def test_track_waas_results_adds_new(self, tmp_path):
         f = tmp_path / "tracked.json"
         f.write_text("{}")
-        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f):
-            count = mcp_server._track_waas_results([{
+        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f), \
+             patch.object(mcp_server, "BACKLOG_JOBS_FILE", tmp_path / "backlog.json"), \
+             patch.object(mcp_server, "APPLIED_JOBS_FILE", tmp_path / "applied.json"), \
+             patch.object(mcp_server, "DISMISSED_JOBS_FILE", tmp_path / "dismissed.json"):
+            summary = mcp_server._track_waas_results([{
                 "job_url": "https://waas.com/jobs/1",
                 "company": "TestCo",
                 "company_yc_batch": "S24",
@@ -548,9 +551,11 @@ class TestTrackedJobsHelpers:
                 "salary_range": "$120k",
                 "location": "SF",
                 "remote": False,
+                "score": 3.0,
             }])
             data = mcp_server._load_tracked()
-        assert count == 1
+        assert summary["new_jobs_found"] == 1
+        assert summary["newly_tracked"] == 1
         entry = data["https://waas.com/jobs/1"]
         assert entry["status"] == "open"
         assert entry["analysis"] is None
@@ -558,15 +563,18 @@ class TestTrackedJobsHelpers:
 
     def test_track_waas_results_skips_existing(self, tmp_path):
         f = tmp_path / "tracked.json"
-        f.write_text(json.dumps({"https://waas.com/jobs/1": {"status": "applied"}}))
-        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f):
-            count = mcp_server._track_waas_results([{
+        f.write_text(json.dumps({"https://waas.com/jobs/1": {"status": "open", "score": 1}}))
+        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f), \
+             patch.object(mcp_server, "BACKLOG_JOBS_FILE", tmp_path / "backlog.json"), \
+             patch.object(mcp_server, "APPLIED_JOBS_FILE", tmp_path / "applied.json"), \
+             patch.object(mcp_server, "DISMISSED_JOBS_FILE", tmp_path / "dismissed.json"):
+            summary = mcp_server._track_waas_results([{
                 "job_url": "https://waas.com/jobs/1",
                 "company": "TestCo",
             }])
             data = mcp_server._load_tracked()
-        assert count == 0
-        assert data["https://waas.com/jobs/1"]["status"] == "applied"
+        assert summary["new_jobs_found"] == 0
+        assert data["https://waas.com/jobs/1"]["status"] == "open"
 
 
 class TestGetTrackedJobs:
@@ -632,57 +640,105 @@ class TestUpdateJobAnalysis:
         assert "error" in result
 
 
+def _patch_all_tracking_files(tmp_path):
+    """Return a context manager that patches all 4 tracking file paths to tmp_path."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _ctx():
+        with patch.object(mcp_server, "TRACKED_JOBS_FILE", tmp_path / "tracked.json"), \
+             patch.object(mcp_server, "BACKLOG_JOBS_FILE", tmp_path / "backlog.json"), \
+             patch.object(mcp_server, "APPLIED_JOBS_FILE", tmp_path / "applied.json"), \
+             patch.object(mcp_server, "DISMISSED_JOBS_FILE", tmp_path / "dismissed.json"):
+            yield
+    return _ctx()
+
+
 class TestMarkStatus:
     def _setup(self, tmp_path):
-        f = tmp_path / "tracked.json"
-        f.write_text(json.dumps({
-            "https://waas.com/1": {"status": "open", "date_applied": None}
+        (tmp_path / "tracked.json").write_text(json.dumps({
+            "https://waas.com/1": {"status": "open", "date_applied": None, "score": 3}
         }))
-        return f
 
-    def test_mark_applied(self, tmp_path):
-        f = self._setup(tmp_path)
-        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f):
+    def test_mark_applied_moves_to_applied_file(self, tmp_path):
+        self._setup(tmp_path)
+        with _patch_all_tracking_files(tmp_path):
             result = json.loads(mcp_server.mark_applied("https://waas.com/1"))
-            data = mcp_server._load_tracked()
+            tracked = mcp_server._load_tracked()
+            applied = mcp_server._load_applied()
         assert result["status"] == "applied"
-        assert data["https://waas.com/1"]["status"] == "applied"
-        assert data["https://waas.com/1"]["date_applied"] is not None
+        assert "https://waas.com/1" not in tracked
+        assert "https://waas.com/1" in applied
+        assert applied["https://waas.com/1"]["status"] == "applied"
+        assert applied["https://waas.com/1"]["date_applied"] is not None
 
-    def test_mark_dismissed(self, tmp_path):
-        f = self._setup(tmp_path)
-        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f):
+    def test_mark_dismissed_moves_to_dismissed_file(self, tmp_path):
+        self._setup(tmp_path)
+        with _patch_all_tracking_files(tmp_path):
             result = json.loads(mcp_server.mark_dismissed("https://waas.com/1"))
-            data = mcp_server._load_tracked()
+            tracked = mcp_server._load_tracked()
+            dismissed = mcp_server._load_dismissed()
         assert result["status"] == "dismissed"
-        assert data["https://waas.com/1"]["status"] == "dismissed"
+        assert "https://waas.com/1" not in tracked
+        assert "https://waas.com/1" in dismissed
 
-    def test_mark_open_reverts(self, tmp_path):
-        f = tmp_path / "tracked.json"
-        f.write_text(json.dumps({
-            "https://waas.com/1": {"status": "applied", "date_applied": "2026-03-18"}
+    def test_mark_open_moves_from_applied_to_tracked(self, tmp_path):
+        (tmp_path / "tracked.json").write_text("{}")
+        (tmp_path / "applied.json").write_text(json.dumps({
+            "https://waas.com/1": {"status": "applied", "date_applied": "2026-03-18", "score": 3}
         }))
-        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f):
+        with _patch_all_tracking_files(tmp_path):
             result = json.loads(mcp_server.mark_open("https://waas.com/1"))
-            data = mcp_server._load_tracked()
+            tracked = mcp_server._load_tracked()
+            applied = mcp_server._load_applied()
         assert result["status"] == "open"
-        assert data["https://waas.com/1"]["status"] == "open"
-        assert data["https://waas.com/1"]["date_applied"] is None
+        assert "https://waas.com/1" in tracked
+        assert tracked["https://waas.com/1"]["date_applied"] is None
+        assert "https://waas.com/1" not in applied
+
+    def test_mark_open_demotes_lowest_when_at_cap(self, tmp_path):
+        # Tracked is full (2 jobs, max_tracked=2), mark_open should demote lowest
+        (tmp_path / "tracked.json").write_text(json.dumps({
+            "https://waas.com/a": {"status": "open", "score": 5},
+            "https://waas.com/b": {"status": "open", "score": 1},
+        }))
+        (tmp_path / "applied.json").write_text(json.dumps({
+            "https://waas.com/c": {"status": "applied", "score": 3}
+        }))
+        with _patch_all_tracking_files(tmp_path), \
+             patch.object(mcp_server, "_max_tracked", return_value=2):
+            mcp_server.mark_open("https://waas.com/c")
+            tracked = mcp_server._load_tracked()
+            backlog = mcp_server._load_backlog()
+        assert "https://waas.com/c" in tracked
+        assert "https://waas.com/b" in backlog  # lowest score demoted
+
+    def test_mark_applied_backfills_from_backlog(self, tmp_path):
+        (tmp_path / "tracked.json").write_text(json.dumps({
+            "https://waas.com/1": {"status": "open", "score": 3}
+        }))
+        (tmp_path / "backlog.json").write_text(json.dumps({
+            "https://waas.com/2": {"status": "open", "score": 2}
+        }))
+        with _patch_all_tracking_files(tmp_path), \
+             patch.object(mcp_server, "_max_tracked", return_value=2):
+            result = json.loads(mcp_server.mark_applied("https://waas.com/1"))
+            tracked = mcp_server._load_tracked()
+        assert result["backfilled"] == 1
+        assert "https://waas.com/2" in tracked
 
     def test_mark_unknown_job_errors(self, tmp_path):
-        f = tmp_path / "tracked.json"
-        f.write_text("{}")
-        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f):
+        (tmp_path / "tracked.json").write_text("{}")
+        with _patch_all_tracking_files(tmp_path):
             result = json.loads(mcp_server.mark_applied("https://waas.com/nope"))
         assert "error" in result
 
 
 class TestValidateTrackedJobs:
     def test_removes_dead_listings(self, tmp_path):
-        f = tmp_path / "tracked.json"
-        f.write_text(json.dumps({
-            "https://waas.com/alive": {"status": "open"},
-            "https://waas.com/dead": {"status": "open"},
+        (tmp_path / "tracked.json").write_text(json.dumps({
+            "https://waas.com/alive": {"status": "open", "score": 3},
+            "https://waas.com/dead": {"status": "open", "score": 1},
         }))
 
         def mock_head(url, **kwargs):
@@ -690,7 +746,7 @@ class TestValidateTrackedJobs:
             resp.status_code = 200 if "alive" in url else 404
             return resp
 
-        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f), \
+        with _patch_all_tracking_files(tmp_path), \
              patch("requests.head", side_effect=mock_head):
             result = json.loads(mcp_server.validate_tracked_jobs())
             data = mcp_server._load_tracked()
@@ -701,26 +757,34 @@ class TestValidateTrackedJobs:
         assert "https://waas.com/alive" in data
         assert "https://waas.com/dead" not in data
 
-    def test_skips_applied_and_dismissed(self, tmp_path):
-        f = tmp_path / "tracked.json"
-        f.write_text(json.dumps({
-            "https://waas.com/applied": {"status": "applied"},
-            "https://waas.com/dismissed": {"status": "dismissed"},
+    def test_backfills_after_removing(self, tmp_path):
+        (tmp_path / "tracked.json").write_text(json.dumps({
+            "https://waas.com/dead": {"status": "open", "score": 1},
         }))
-        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f), \
-             patch("requests.head") as mock_head:
+        (tmp_path / "backlog.json").write_text(json.dumps({
+            "https://waas.com/waiting": {"status": "open", "score": 5},
+        }))
+
+        def mock_head(url, **kwargs):
+            resp = MagicMock()
+            resp.status_code = 404
+            return resp
+
+        with _patch_all_tracking_files(tmp_path), \
+             patch("requests.head", side_effect=mock_head), \
+             patch.object(mcp_server, "_max_tracked", return_value=2):
             result = json.loads(mcp_server.validate_tracked_jobs())
-        mock_head.assert_not_called()
-        assert result["validated"] == 0
-        assert result["removed"] == 0
+            tracked = mcp_server._load_tracked()
+
+        assert result["backfilled"] == 1
+        assert "https://waas.com/waiting" in tracked
 
     def test_network_error_removes_job(self, tmp_path):
         import requests
-        f = tmp_path / "tracked.json"
-        f.write_text(json.dumps({
-            "https://waas.com/timeout": {"status": "open"},
+        (tmp_path / "tracked.json").write_text(json.dumps({
+            "https://waas.com/timeout": {"status": "open", "score": 1},
         }))
-        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f), \
+        with _patch_all_tracking_files(tmp_path), \
              patch("requests.head", side_effect=requests.ConnectionError):
             result = json.loads(mcp_server.validate_tracked_jobs())
         assert result["removed"] == 1
@@ -728,10 +792,6 @@ class TestValidateTrackedJobs:
 
 class TestScanWaasTracking:
     def test_scan_waas_tracks_new_jobs(self, tmp_path):
-        """scan_waas should append new jobs to tracked_jobs.json."""
-        f = tmp_path / "tracked.json"
-        f.write_text("{}")
-
         mock_results = [{
             "parsed": {
                 "company": "TestCo", "location": "SF", "remote": False,
@@ -745,10 +805,46 @@ class TestScanWaasTracking:
             "source": "waas",
         }]
 
-        with patch.object(mcp_server, "TRACKED_JOBS_FILE", f), \
+        with _patch_all_tracking_files(tmp_path), \
              patch("waas.scan_and_filter_waas", return_value=(mock_results, [])):
             result = json.loads(mcp_server.scan_waas())
 
-        assert result["newly_tracked"] == 1
-        data = json.loads(f.read_text())
+        assert result["tracking"]["newly_tracked"] == 1
+        data = json.loads((tmp_path / "tracked.json").read_text())
         assert "https://waas.com/jobs/1" in data
+
+    def test_top_n_cap_overflows_to_backlog(self, tmp_path):
+        # 3 new jobs but max_tracked=2 — top 2 get tracked, 1 goes to backlog
+        mock_results = [
+            {
+                "parsed": {
+                    "company": f"Co{i}", "location": "SF", "remote": False,
+                    "full_text": "LLM tools",
+                    "job_board_urls": [{"url": f"https://waas.com/jobs/{i}", "type": "waas", "title": "Eng"}],
+                    "salary_range": "", "company_yc_batch": "", "company_size": "",
+                    "seniority": "mid", "is_coding": True,
+                },
+                "matches": {"AI tooling": ["llm"]},
+                "score": float(i),
+                "source": "waas",
+            }
+            for i in [3, 1, 2]
+        ]
+
+        with _patch_all_tracking_files(tmp_path), \
+             patch.object(mcp_server, "_max_tracked", return_value=2), \
+             patch("waas.scan_and_filter_waas", return_value=(mock_results, [])):
+            result = json.loads(mcp_server.scan_waas())
+
+        tracking = result["tracking"]
+        assert tracking["new_jobs_found"] == 3
+        assert tracking["newly_tracked"] == 2
+        assert tracking["backlog_size"] == 1
+
+        tracked = json.loads((tmp_path / "tracked.json").read_text())
+        backlog = json.loads((tmp_path / "backlog.json").read_text())
+        # Top 2 by score (3.0 and 2.0) should be tracked
+        assert "https://waas.com/jobs/3" in tracked
+        assert "https://waas.com/jobs/2" in tracked
+        # Score 1.0 goes to backlog
+        assert "https://waas.com/jobs/1" in backlog

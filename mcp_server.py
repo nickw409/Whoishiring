@@ -32,55 +32,156 @@ def _active_filters() -> dict:
     return active
 
 
-TRACKED_JOBS_FILE = Path(__file__).parent / "tracked_jobs.json"
+_PROJECT_DIR = Path(__file__).parent
+TRACKED_JOBS_FILE = _PROJECT_DIR / "tracked_jobs.json"
+BACKLOG_JOBS_FILE = _PROJECT_DIR / "backlog_jobs.json"
+APPLIED_JOBS_FILE = _PROJECT_DIR / "applied_jobs.json"
+DISMISSED_JOBS_FILE = _PROJECT_DIR / "dismissed_jobs.json"
+
+DEFAULT_MAX_TRACKED = 20
 
 
-def _load_tracked() -> dict:
-    """Load tracked_jobs.json. Returns empty dict if missing or corrupt."""
-    if TRACKED_JOBS_FILE.exists():
+def _load_json(path: Path) -> dict:
+    """Load a JSON dict file. Returns empty dict if missing or corrupt."""
+    if path.exists():
         try:
-            return json.loads(TRACKED_JOBS_FILE.read_text())
+            return json.loads(path.read_text())
         except (json.JSONDecodeError, KeyError):
             return {}
     return {}
 
 
+def _save_json(path: Path, data: dict) -> None:
+    """Write a JSON dict file."""
+    path.write_text(json.dumps(data, indent=2))
+
+
+def _load_tracked() -> dict:
+    return _load_json(TRACKED_JOBS_FILE)
+
+
 def _save_tracked(data: dict) -> None:
-    """Write tracked_jobs.json atomically (read-modify-write)."""
-    TRACKED_JOBS_FILE.write_text(json.dumps(data, indent=2))
+    _save_json(TRACKED_JOBS_FILE, data)
 
 
-def _track_waas_results(formatted: list[dict]) -> int:
-    """Append new WAAS results to tracked_jobs.json. Returns count of newly tracked jobs."""
+def _load_backlog() -> dict:
+    return _load_json(BACKLOG_JOBS_FILE)
+
+
+def _save_backlog(data: dict) -> None:
+    _save_json(BACKLOG_JOBS_FILE, data)
+
+
+def _load_applied() -> dict:
+    return _load_json(APPLIED_JOBS_FILE)
+
+
+def _save_applied(data: dict) -> None:
+    _save_json(APPLIED_JOBS_FILE, data)
+
+
+def _load_dismissed() -> dict:
+    return _load_json(DISMISSED_JOBS_FILE)
+
+
+def _save_dismissed(data: dict) -> None:
+    _save_json(DISMISSED_JOBS_FILE, data)
+
+
+def _max_tracked() -> int:
+    """Read max_tracked from config.yaml tracking section, default 20."""
+    config_file = _PROJECT_DIR / "config.yaml"
+    if config_file.exists():
+        try:
+            import yaml
+            with open(config_file) as f:
+                config = yaml.safe_load(f) or {}
+            return int(config.get("tracking", {}).get("max_tracked", DEFAULT_MAX_TRACKED))
+        except Exception:
+            pass
+    return DEFAULT_MAX_TRACKED
+
+
+def _make_entry(r: dict) -> dict:
+    """Build a tracked/backlog entry from a formatted WAAS result."""
+    return {
+        "company": r.get("company", ""),
+        "yc_batch": r.get("company_yc_batch", ""),
+        "company_size": r.get("company_size", ""),
+        "job_title": r.get("job_title", ""),
+        "seniority": r.get("seniority", "unknown"),
+        "salary_range": r.get("salary_range", ""),
+        "location": r.get("location", ""),
+        "remote": r.get("remote", False),
+        "other_roles": r.get("other_roles", []),
+        "score": r.get("score", 0),
+        "status": "open",
+        "date_added": date.today().isoformat(),
+        "date_applied": None,
+        "analysis": None,
+    }
+
+
+def _backfill_tracked(tracked: dict, backlog: dict, max_n: int) -> int:
+    """Promote top backlog jobs into tracked until tracked reaches max_n.
+
+    Modifies both dicts in place. Returns number promoted.
+    """
+    slots = max_n - len(tracked)
+    if slots <= 0 or not backlog:
+        return 0
+
+    ranked = sorted(backlog.items(), key=lambda kv: kv[1].get("score", 0), reverse=True)
+    promoted = 0
+    for url, entry in ranked[:slots]:
+        tracked[url] = entry
+        del backlog[url]
+        promoted += 1
+    return promoted
+
+
+def _track_waas_results(formatted: list[dict]) -> dict:
+    """Process new WAAS results into the tracking pipeline.
+
+    1. Filter out jobs already in tracked/backlog/applied/dismissed
+    2. Build entries for truly new jobs
+    3. Combine new + existing backlog, rank by score
+    4. Fill tracked up to max_tracked
+    5. Remainder stays in backlog
+
+    Returns summary dict with counts.
+    """
     tracked = _load_tracked()
-    added = 0
-    today = date.today().isoformat()
+    backlog = _load_backlog()
+    applied = _load_applied()
+    dismissed = _load_dismissed()
+    max_n = _max_tracked()
 
+    all_known = set(tracked) | set(backlog) | set(applied) | set(dismissed)
+
+    # Build entries for truly new jobs
+    new_entries = {}
     for r in formatted:
         job_url = r.get("job_url", "")
-        if not job_url or job_url in tracked:
+        if not job_url or job_url in all_known:
             continue
+        new_entries[job_url] = _make_entry(r)
 
-        tracked[job_url] = {
-            "company": r.get("company", ""),
-            "yc_batch": r.get("company_yc_batch", ""),
-            "company_size": r.get("company_size", ""),
-            "job_title": r.get("job_title", ""),
-            "seniority": r.get("seniority", "unknown"),
-            "salary_range": r.get("salary_range", ""),
-            "location": r.get("location", ""),
-            "remote": r.get("remote", False),
-            "other_roles": r.get("other_roles", []),
-            "status": "open",
-            "date_added": today,
-            "date_applied": None,
-            "analysis": None,
-        }
-        added += 1
+    # Add new entries to backlog pool
+    backlog.update(new_entries)
 
-    if added:
-        _save_tracked(tracked)
-    return added
+    # Fill tracked from backlog up to max_n
+    promoted = _backfill_tracked(tracked, backlog, max_n)
+
+    _save_tracked(tracked)
+    _save_backlog(backlog)
+
+    return {
+        "new_jobs_found": len(new_entries),
+        "newly_tracked": promoted,
+        "backlog_size": len(backlog),
+        "tracked_size": len(tracked),
+    }
 
 
 def _scan_hn(months: int, ignore_seen: bool) -> tuple[list[dict], list[dict], list[str]]:
@@ -362,8 +463,8 @@ def scan_waas(ignore_seen: bool = False, group_by_company: bool = True) -> str:
 
     formatted = formatted[:WAAS_MAX_RESULTS]
 
-    # Track new jobs (side effect — does not change the response)
-    newly_tracked = _track_waas_results(formatted)
+    # Track new jobs (side effect — does not change the results)
+    tracking_summary = _track_waas_results(formatted)
 
     active = _active_filters()
     response = {
@@ -372,7 +473,7 @@ def scan_waas(ignore_seen: bool = False, group_by_company: bool = True) -> str:
         "total_all_roles": total_all_roles,
         "total_filtered": len(filtered_out),
         "grouped_by_company": group_by_company,
-        "newly_tracked": newly_tracked,
+        "tracking": tracking_summary,
         "results": formatted,
     }
     if active:
@@ -649,17 +750,27 @@ def update_config(
 
 @mcp.tool()
 def get_tracked_jobs() -> str:
-    """Return the full contents of tracked_jobs.json.
+    """Return all tracked jobs (the active analysis pipeline).
 
+    tracked_jobs.json holds up to max_tracked (default 20) open jobs.
     Each entry is keyed by WAAS job URL and contains: company, yc_batch,
     company_size, job_title, seniority, salary_range, location, remote,
-    other_roles, status (open/applied/dismissed), date_added, date_applied,
-    and analysis (null until populated via update_job_analysis).
+    other_roles, score, status, date_added, date_applied, and analysis
+    (null until populated via update_job_analysis).
 
-    Use this to find jobs needing analysis (analysis is null) or to review
-    the current state of all tracked jobs.
+    Use this to find jobs needing analysis (analysis is null).
     """
     return json.dumps(_load_tracked(), indent=2)
+
+
+@mcp.tool()
+def get_applied_jobs() -> str:
+    """Return all jobs that have been marked as applied.
+
+    These were moved out of tracked_jobs.json when mark_applied was called.
+    Each entry preserves the full job data including analysis.
+    """
+    return json.dumps(_load_applied(), indent=2)
 
 
 @mcp.tool()
@@ -696,7 +807,10 @@ def update_job_analysis(job_url: str, fit_explanation: str, odds: str,
 
 @mcp.tool()
 def mark_applied(job_url: str) -> str:
-    """Set a tracked job's status to "applied" and record today's date.
+    """Move a tracked job to applied_jobs.json with status "applied".
+
+    Sets date_applied to today. Backfills the freed tracked slot from
+    the backlog (highest score first).
 
     Args:
         job_url: The WAAS job URL to mark as applied.
@@ -704,15 +818,30 @@ def mark_applied(job_url: str) -> str:
     tracked = _load_tracked()
     if job_url not in tracked:
         return json.dumps({"error": f"Job not tracked: {job_url}"})
-    tracked[job_url]["status"] = "applied"
-    tracked[job_url]["date_applied"] = date.today().isoformat()
+
+    entry = tracked.pop(job_url)
+    entry["status"] = "applied"
+    entry["date_applied"] = date.today().isoformat()
+
+    applied = _load_applied()
+    applied[job_url] = entry
+    _save_applied(applied)
+
+    # Backfill from backlog
+    backlog = _load_backlog()
+    promoted = _backfill_tracked(tracked, backlog, _max_tracked())
     _save_tracked(tracked)
-    return json.dumps({"status": "applied", "job_url": job_url})
+    if promoted:
+        _save_backlog(backlog)
+
+    return json.dumps({"status": "applied", "job_url": job_url, "backfilled": promoted})
 
 
 @mcp.tool()
 def mark_dismissed(job_url: str) -> str:
-    """Set a tracked job's status to "dismissed".
+    """Move a tracked job to dismissed_jobs.json with status "dismissed".
+
+    Backfills the freed tracked slot from the backlog (highest score first).
 
     Args:
         job_url: The WAAS job URL to dismiss.
@@ -720,33 +849,80 @@ def mark_dismissed(job_url: str) -> str:
     tracked = _load_tracked()
     if job_url not in tracked:
         return json.dumps({"error": f"Job not tracked: {job_url}"})
-    tracked[job_url]["status"] = "dismissed"
+
+    entry = tracked.pop(job_url)
+    entry["status"] = "dismissed"
+
+    dismissed = _load_dismissed()
+    dismissed[job_url] = entry
+    _save_dismissed(dismissed)
+
+    # Backfill from backlog
+    backlog = _load_backlog()
+    promoted = _backfill_tracked(tracked, backlog, _max_tracked())
     _save_tracked(tracked)
-    return json.dumps({"status": "dismissed", "job_url": job_url})
+    if promoted:
+        _save_backlog(backlog)
+
+    return json.dumps({"status": "dismissed", "job_url": job_url, "backfilled": promoted})
 
 
 @mcp.tool()
 def mark_open(job_url: str) -> str:
-    """Revert a tracked job's status to "open" and clear date_applied.
+    """Move a job from applied or dismissed back to tracked.
+
+    If tracked is at capacity, the lowest-score tracked job is demoted
+    to the backlog to make room.
 
     Args:
         job_url: The WAAS job URL to revert to open.
     """
+    # Find the job in applied or dismissed
+    applied = _load_applied()
+    dismissed = _load_dismissed()
+    entry = None
+    source = None
+
+    if job_url in applied:
+        entry = applied.pop(job_url)
+        source = "applied"
+    elif job_url in dismissed:
+        entry = dismissed.pop(job_url)
+        source = "dismissed"
+
+    if entry is None:
+        return json.dumps({"error": f"Job not found in applied or dismissed: {job_url}"})
+
+    entry["status"] = "open"
+    entry["date_applied"] = None
+
     tracked = _load_tracked()
-    if job_url not in tracked:
-        return json.dumps({"error": f"Job not tracked: {job_url}"})
-    tracked[job_url]["status"] = "open"
-    tracked[job_url]["date_applied"] = None
+    max_n = _max_tracked()
+
+    # If at capacity, demote lowest-score tracked job to backlog
+    if len(tracked) >= max_n:
+        backlog = _load_backlog()
+        lowest_url = min(tracked, key=lambda u: tracked[u].get("score", 0))
+        backlog[lowest_url] = tracked.pop(lowest_url)
+        _save_backlog(backlog)
+
+    tracked[job_url] = entry
     _save_tracked(tracked)
+
+    if source == "applied":
+        _save_applied(applied)
+    else:
+        _save_dismissed(dismissed)
+
     return json.dumps({"status": "open", "job_url": job_url})
 
 
 @mcp.tool()
 def validate_tracked_jobs() -> str:
-    """Check all "open" tracked jobs and remove any whose listings are no longer live.
+    """Check all tracked jobs and remove any whose listings are no longer live.
 
-    Hits each open job's URL to verify the listing still exists. Removes dead
-    listings from tracked_jobs.json entirely. Skips applied and dismissed jobs.
+    Hits each job's URL to verify the listing still exists. Removes dead
+    listings from tracked_jobs.json entirely, then backfills from the backlog.
 
     Returns a summary with validated count, removed count, and removed URLs.
     Run this before scan_waas to clean out stale listings.
@@ -754,10 +930,10 @@ def validate_tracked_jobs() -> str:
     import requests
 
     tracked = _load_tracked()
-    open_urls = [url for url, entry in tracked.items() if entry.get("status") == "open"]
+    urls_to_check = list(tracked.keys())
 
     removed = []
-    for url in open_urls:
+    for url in urls_to_check:
         try:
             resp = requests.head(url, timeout=10, allow_redirects=True, headers={
                 "User-Agent": "Mozilla/5.0 (compatible; HNJobScanner/1.0)"
@@ -770,13 +946,19 @@ def validate_tracked_jobs() -> str:
     for url in removed:
         del tracked[url]
 
-    if removed:
-        _save_tracked(tracked)
+    # Backfill from backlog
+    backlog = _load_backlog()
+    promoted = _backfill_tracked(tracked, backlog, _max_tracked())
+
+    _save_tracked(tracked)
+    if removed or promoted:
+        _save_backlog(backlog)
 
     return json.dumps({
-        "validated": len(open_urls) - len(removed),
+        "validated": len(urls_to_check) - len(removed),
         "removed": len(removed),
         "removed_jobs": removed,
+        "backfilled": promoted,
     }, indent=2)
 
 

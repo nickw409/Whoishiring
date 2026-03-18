@@ -7,3 +7,5 @@ preferences:
 filters:
   max_seniority: mid       # intern, junior, mid, senior, staff+ (filter out above this)
   coding_only: true         # filter out non-coding roles (product, design, sales, management)
+tracking:
+  max_tracked: 20           # max jobs in tracked_jobs.json (overflow goes to backlog)
