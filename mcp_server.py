@@ -125,18 +125,18 @@ def _make_entry(r: dict) -> dict:
 def _backfill_tracked(tracked: dict, backlog: dict, max_n: int) -> int:
     """Promote top backlog jobs into tracked until tracked reaches max_n.
 
-    Modifies both dicts in place. Returns number promoted.
+    Modifies both dicts in place. Returns list of (url, entry) tuples promoted.
     """
     slots = max_n - len(tracked)
     if slots <= 0 or not backlog:
-        return 0
+        return []
 
     ranked = sorted(backlog.items(), key=lambda kv: kv[1].get("score", 0), reverse=True)
-    promoted = 0
+    promoted = []
     for url, entry in ranked[:slots]:
         tracked[url] = entry
         del backlog[url]
-        promoted += 1
+        promoted.append((url, entry))
     return promoted
 
 
@@ -178,7 +178,7 @@ def _track_waas_results(formatted: list[dict]) -> dict:
 
     return {
         "new_jobs_found": len(new_entries),
-        "newly_tracked": promoted,
+        "newly_tracked": len(promoted),
         "backlog_size": len(backlog),
         "tracked_size": len(tracked),
     }
@@ -837,7 +837,11 @@ def mark_applied(job_url: str) -> str:
     if promoted:
         _save_backlog(backlog)
 
-    return json.dumps({"status": "applied", "job_url": job_url, "backfilled": promoted})
+    result = {"status": "applied", "job_url": job_url, "backfilled": len(promoted)}
+    if promoted:
+        url, entry = promoted[0]
+        result["next_job"] = {"job_url": url, **entry}
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
@@ -867,7 +871,11 @@ def mark_dismissed(job_url: str) -> str:
     if promoted:
         _save_backlog(backlog)
 
-    return json.dumps({"status": "dismissed", "job_url": job_url, "backfilled": promoted})
+    result = {"status": "dismissed", "job_url": job_url, "backfilled": len(promoted)}
+    if promoted:
+        url, entry = promoted[0]
+        result["next_job"] = {"job_url": url, **entry}
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
@@ -961,7 +969,7 @@ def validate_tracked_jobs() -> str:
         "validated": len(urls_to_check) - len(removed),
         "removed": len(removed),
         "removed_jobs": removed,
-        "backfilled": promoted,
+        "backfilled": len(promoted),
     }, indent=2)
 
 
