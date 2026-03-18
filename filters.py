@@ -226,7 +226,11 @@ def is_coding_job(title, text=""):
 # ---------------------------------------------------------------------------
 
 def is_outside_us(parsed):
-    """Return True if the job is clearly located outside the US and not remote."""
+    """Return True if the job is clearly located outside the US and not remote.
+
+    For WAAS jobs (source='waas'), locations that don't match any US pattern
+    are filtered out. For HN jobs, unknown locations pass (benefit of the doubt).
+    """
     if parsed["remote"]:
         return False
     location = parsed["location"]
@@ -234,7 +238,12 @@ def is_outside_us(parsed):
         return False
     if _US_RE.search(location):
         return False
-    return bool(_NON_US_RE.search(location))
+    if _NON_US_RE.search(location):
+        return True
+    # WAAS has structured location data — if it doesn't match US, filter it
+    if parsed.get("source") == "waas":
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
