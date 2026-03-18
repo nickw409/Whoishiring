@@ -776,6 +776,21 @@ def update_config(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
+def reset_tracking() -> str:
+    """Reset all tracking files to empty state.
+
+    Clears tracked_jobs.json, backlog_jobs.json, applied_jobs.json,
+    dismissed_jobs.json, and seen_waas.json. Use this to start fresh
+    without restarting the MCP server.
+    """
+    _save_json(TRACKED_JOBS_FILE, {})
+    _save_json(BACKLOG_JOBS_FILE, {})
+    _save_json(APPLIED_JOBS_FILE, {})
+    _save_json(DISMISSED_JOBS_FILE, {})
+    _save_json(waas.WAAS_SEEN_FILE, {"jobs": {}})
+    return json.dumps({"status": "reset", "files_cleared": 5})
+
+@mcp.tool()
 def get_tracked_jobs() -> str:
     """Return all tracked jobs (the active analysis pipeline).
 
