@@ -2,7 +2,6 @@
 """MCP server for HN Who's Hiring job scanner."""
 
 import json
-import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -34,11 +33,10 @@ def _active_filters() -> dict:
 
 
 _PROJECT_DIR = Path(__file__).parent
-_TRACKING_DIR = Path(os.environ.get("TRACKING_DIR", str(_PROJECT_DIR)))
-TRACKED_JOBS_FILE = _TRACKING_DIR / "tracked_jobs.json"
-BACKLOG_JOBS_FILE = _TRACKING_DIR / "backlog_jobs.json"
-APPLIED_JOBS_FILE = _TRACKING_DIR / "applied_jobs.json"
-DISMISSED_JOBS_FILE = _TRACKING_DIR / "dismissed_jobs.json"
+TRACKED_JOBS_FILE = _PROJECT_DIR / "tracked_jobs.json"
+BACKLOG_JOBS_FILE = _PROJECT_DIR / "backlog_jobs.json"
+APPLIED_JOBS_FILE = _PROJECT_DIR / "applied_jobs.json"
+DISMISSED_JOBS_FILE = _PROJECT_DIR / "dismissed_jobs.json"
 
 DEFAULT_MAX_TRACKED = 20
 
@@ -773,6 +771,16 @@ def get_applied_jobs() -> str:
     Each entry preserves the full job data including analysis.
     """
     return json.dumps(_load_applied(), indent=2)
+
+
+@mcp.tool()
+def get_dismissed_jobs() -> str:
+    """Return all jobs that have been marked as dismissed.
+
+    These were moved out of tracked_jobs.json when mark_dismissed was called.
+    Each entry preserves the full job data including analysis.
+    """
+    return json.dumps(_load_dismissed(), indent=2)
 
 
 @mcp.tool()
