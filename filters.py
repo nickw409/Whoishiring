@@ -225,23 +225,45 @@ def is_coding_job(title, text=""):
 # Location filtering
 # ---------------------------------------------------------------------------
 
+_WAAS_US_RE = re.compile(r",\s*US\b", re.IGNORECASE)
+
+
 def is_outside_us(parsed):
     """Return True if the job is clearly located outside the US and not remote.
 
-    For WAAS jobs (source='waas'), locations that don't match any US pattern
-    are filtered out. For HN jobs, unknown locations pass (benefit of the doubt).
+    For WAAS jobs (source='waas'), locations must contain ', US' country code
+    or match a known US city to pass. For HN jobs, the ', XX' state
+    abbreviation pattern is used, and unknown locations pass (benefit of the doubt).
     """
     if parsed["remote"]:
         return False
     location = parsed["location"]
     if not location:
         return False
+
+    # WAAS has structured "City, State, CountryCode" — check for US country code
+    if parsed.get("source") == "waas":
+        if _WAAS_US_RE.search(location):
+            return False
+        # Also check known US city names (without the ambiguous ,XX pattern)
+        if _US_RE.search(location):
+            # But exclude the generic ",\s*[A-Z]{2}" match — could be foreign country codes
+            # Only trust explicit US city/keyword matches
+            us_cities = re.compile(
+                r"\b(usa|united states|new york|nyc|san francisco|los angeles|chicago"
+                r"|seattle|boston|austin|denver|atlanta|miami|dallas|houston|portland"
+                r"|phoenix|san diego|minneapolis|detroit|baltimore|washington dc"
+                r"|bay area|silicon valley)\b",
+                re.IGNORECASE,
+            )
+            if us_cities.search(location):
+                return False
+        return True
+
+    # HN: use the full US regex (includes ,\s*[A-Z]{2} for state abbreviations)
     if _US_RE.search(location):
         return False
     if _NON_US_RE.search(location):
-        return True
-    # WAAS has structured location data — if it doesn't match US, filter it
-    if parsed.get("source") == "waas":
         return True
     return False
 
