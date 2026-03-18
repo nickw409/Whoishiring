@@ -19,6 +19,18 @@ from filters import SeenTracker, estimate_seniority
 mcp = FastMCP(name="HN Who's Hiring")
 
 
+def _active_filters() -> dict:
+    """Return the active result filters from config for inclusion in scan responses."""
+    config = hn_jobs.load_config()
+    f = config.get("filters", {})
+    active = {}
+    if f.get("max_seniority"):
+        active["max_seniority"] = f["max_seniority"]
+    if f.get("coding_only"):
+        active["coding_only"] = True
+    return active
+
+
 def _scan_hn(months: int, ignore_seen: bool) -> tuple[list[dict], list[dict], list[str]]:
     """Extract HN scanning logic for reuse in scan_jobs and scan_all.
 
@@ -226,12 +238,15 @@ def scan_jobs(months: int = 1, ignore_seen: bool = False) -> str:
     if not thread_titles:
         return json.dumps({"error": "No hiring threads found"})
 
+    active = _active_filters()
     output = {
         "threads": thread_titles,
         "total_results": len(results),
         "total_filtered": len(filtered_out),
         "results": _format_hn_results(results),
     }
+    if active:
+        output["active_filters"] = active
 
     return json.dumps(output, indent=2)
 
@@ -295,14 +310,18 @@ def scan_waas(ignore_seen: bool = False, group_by_company: bool = True) -> str:
 
     formatted = formatted[:WAAS_MAX_RESULTS]
 
-    return json.dumps({
+    active = _active_filters()
+    response = {
         "source": "waas",
         "total_results": len(formatted),
         "total_all_roles": total_all_roles,
         "total_filtered": len(filtered_out),
         "grouped_by_company": group_by_company,
         "results": formatted,
-    }, indent=2)
+    }
+    if active:
+        response["active_filters"] = active
+    return json.dumps(response, indent=2)
 
 
 @mcp.tool()
@@ -384,6 +403,7 @@ def scan_all(ignore_seen: bool = False, months: int = 1, group_by_company: bool 
 
     combined = combined[:ALL_MAX_RESULTS]
 
+    active = _active_filters()
     result = {
         "sources": ["hn", "waas"],
         "threads": thread_titles,
@@ -396,6 +416,8 @@ def scan_all(ignore_seen: bool = False, months: int = 1, group_by_company: bool 
         "grouped_by_company": group_by_company,
         "results": combined,
     }
+    if active:
+        result["active_filters"] = active
     if errors:
         result["errors"] = errors
 
