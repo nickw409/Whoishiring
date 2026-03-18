@@ -156,16 +156,13 @@ class TestScanWaas:
         with patch("waas.scan_and_filter_waas", return_value=(waas_results, [])):
             result = json.loads(mcp_server.scan_waas(ignore_seen=True))
 
-        assert "source" in result
-        assert result["source"] == "waas"
-        assert "total_results" in result
-        assert "results" in result
+        assert result["status"] == "ok"
+        assert "tracking" in result
 
     def test_exception_returns_error_field(self):
         with patch("waas.scan_and_filter_waas", side_effect=Exception("Browser failed")):
             result = json.loads(mcp_server.scan_waas())
         assert "error" in result
-        assert result["total_results"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -354,36 +351,17 @@ class TestScanWaasPlaywrightError:
             result = json.loads(mcp_server.scan_waas())
 
         assert "error" in result
-        assert "Browser closed unexpectedly" in result["error"]
-        assert result["total_results"] == 0
-        assert result["results"] == []
 
 
-# ---------------------------------------------------------------------------
-# scan_waas — result format matches HN format with WAAS-specific fields
-# ---------------------------------------------------------------------------
-
-class TestScanWaasResultFormat:
-    def test_result_format_has_waas_specific_fields(self):
-        """Verify WAAS results include source='waas' and WAAS-specific fields."""
+class TestScanWaasResponseFormat:
+    def test_success_returns_status_and_tracking(self):
+        """scan_waas returns status + tracking summary, no job results."""
         waas_result = _make_waas_result(company="YCStartup", score=4.0)
-        waas_result["parsed"]["seniority"] = "junior"
-
         with patch("waas.scan_and_filter_waas", return_value=([waas_result], [])):
-            result = json.loads(mcp_server.scan_waas(ignore_seen=True, group_by_company=False))
-
-        assert len(result["results"]) == 1
-        r = result["results"][0]
-        assert r["source"] == "waas"
-        assert r["company"] == "YCStartup"
-        assert "job_title" in r
-        assert "salary_range" in r
-        assert r["salary_range"] == "$150k-$200k"
-        assert "company_yc_batch" in r
-        assert r["company_yc_batch"] == "W24"
-        assert "company_size" in r
-        assert r["company_size"] == "10 people"
-        assert "seniority" in r
+            result = json.loads(mcp_server.scan_waas())
+        assert result["status"] == "ok"
+        assert "tracking" in result
+        assert "results" not in result
 
 
 # ---------------------------------------------------------------------------

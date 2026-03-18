@@ -463,22 +463,15 @@ def scan_waas(ignore_seen: bool = False, group_by_company: bool = True) -> str:
 
     formatted = formatted[:WAAS_MAX_RESULTS]
 
-    # Track new jobs (side effect — does not change the results)
+    # Track new jobs
     tracking_summary = _track_waas_results(formatted)
 
-    active = _active_filters()
-    response = {
-        "source": "waas",
-        "total_results": len(formatted),
-        "total_all_roles": total_all_roles,
+    return json.dumps({
+        "status": "ok",
+        "total_scanned": total_all_roles,
         "total_filtered": len(filtered_out),
-        "grouped_by_company": group_by_company,
         "tracking": tracking_summary,
-        "results": formatted,
-    }
-    if active:
-        response["active_filters"] = active
-    return json.dumps(response, indent=2)
+    }, indent=2)
 
 
 @mcp.tool()
