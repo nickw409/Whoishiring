@@ -11,4 +11,5 @@ seen_waas.json
 .vex/validation.json
 .vex/drift.json
 .arc.yaml
+.arc/
 .plans/

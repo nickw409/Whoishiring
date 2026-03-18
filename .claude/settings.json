@@ -1,0 +1,21 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "[ -z \"${ARC_HOME:-}\" ] \u0026\u0026 exit 0; \"$ARC_HOME/hooks/arc-block-orchestrator-writes.sh\"",
+            "description": "arc: Block orchestrator from writing files directly",
+            "type": "command"
+          },
+          {
+            "command": "[ -z \"${ARC_HOME:-}\" ] \u0026\u0026 exit 0; \"$ARC_HOME/hooks/arc-restrict-review-writes.sh\"",
+            "description": "arc: Restrict review agents to their output file",
+            "type": "command"
+          }
+        ],
+        "matcher": "Write|Edit|Bash"
+      }
+    ]
+  }
+}
