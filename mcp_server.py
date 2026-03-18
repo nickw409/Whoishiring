@@ -485,10 +485,44 @@ def get_job_details(job_url: str) -> str:
     Args:
         job_url: The WAAS job URL (e.g. https://www.workatastartup.com/jobs/12345).
     """
+    # Check in-memory cache first (populated by most recent scan)
     for r in _full_results_cache:
         if r.get("job_url") == job_url:
             return json.dumps(r, indent=2)
-    return json.dumps({"error": f"Job not found in cache: {job_url}. Run scan_waas or scan_all first."})
+
+    # Fall back to fetching the page directly
+    import requests
+    try:
+        resp = requests.get(job_url, timeout=15, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; HNJobScanner/1.0)"
+        })
+        resp.raise_for_status()
+        # Extract description from the page
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(resp.text, "html.parser")
+        # WAAS job pages have the description in a specific div
+        desc_div = soup.select_one(".prose") or soup.select_one("[class*=description]")
+        description = desc_div.get_text(separator="\n", strip=True) if desc_div else ""
+        title_el = soup.select_one("h1")
+        title = title_el.get_text(strip=True) if title_el else ""
+
+        # Check tracked/backlog for metadata
+        tracked = _load_tracked()
+        backlog = _load_backlog()
+        entry = tracked.get(job_url) or backlog.get(job_url) or {}
+
+        return json.dumps({
+            "job_url": job_url,
+            "job_title": entry.get("job_title", title),
+            "company": entry.get("company", ""),
+            "location": entry.get("location", ""),
+            "remote": entry.get("remote", False),
+            "salary_range": entry.get("salary_range", ""),
+            "seniority": entry.get("seniority", "unknown"),
+            "full_text": description,
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"error": f"Could not fetch job details: {e}"})
 
 
 ALL_MAX_RESULTS = 1000

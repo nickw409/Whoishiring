@@ -1228,10 +1228,14 @@ class TestGetJobDetails:
         result = json.loads(get_job_details("https://waas.com/jobs/123"))
         assert result["full_text"] == "Full description here"
 
-    def test_not_found(self, monkeypatch):
+    def test_not_in_cache_fetches_page(self, monkeypatch):
         from mcp_server import get_job_details
         import mcp_server
+        import requests as req_module
         mcp_server._full_results_cache = []
+
+        # Mock the HTTP fetch to fail
+        monkeypatch.setattr(req_module, "get", MagicMock(side_effect=req_module.ConnectionError("no")))
         result = json.loads(get_job_details("https://waas.com/jobs/999"))
         assert "error" in result
 
