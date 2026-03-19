@@ -38,6 +38,7 @@ BACKLOG_JOBS_FILE = _PROJECT_DIR / "backlog_jobs.json"
 APPLIED_JOBS_FILE = _PROJECT_DIR / "applied_jobs.json"
 DISMISSED_JOBS_FILE = _PROJECT_DIR / "dismissed_jobs.json"
 LONGSHOT_JOBS_FILE = _PROJECT_DIR / "longshot_jobs.json"
+JOB_DESCRIPTIONS_FILE = _PROJECT_DIR / "job_descriptions.json"
 
 DEFAULT_MAX_TRACKED = 20
 
@@ -95,6 +96,36 @@ def _load_longshot() -> dict:
 
 def _save_longshot(data: dict) -> None:
     _save_json(LONGSHOT_JOBS_FILE, data)
+
+
+def _load_descriptions() -> dict:
+    return _load_json(JOB_DESCRIPTIONS_FILE)
+
+
+def _save_descriptions(data: dict) -> None:
+    _save_json(JOB_DESCRIPTIONS_FILE, data)
+
+
+def _cache_descriptions(formatted: list[dict]) -> None:
+    """Cache full descriptions from scan results to disk."""
+    descs = _load_descriptions()
+    for r in formatted:
+        job_url = r.get("job_url", "")
+        full_text = r.get("full_text", "")
+        if job_url and full_text:
+            descs[job_url] = full_text
+    _save_descriptions(descs)
+
+
+def _prune_descriptions() -> None:
+    """Remove cached descriptions for jobs not in tracked, backlog, or applied."""
+    descs = _load_descriptions()
+    if not descs:
+        return
+    keep = set(_load_tracked()) | set(_load_backlog()) | set(_load_applied())
+    pruned = {url: text for url, text in descs.items() if url in keep}
+    if len(pruned) < len(descs):
+        _save_descriptions(pruned)
 
 
 def _max_tracked() -> int:
@@ -185,6 +216,7 @@ def _track_waas_results(formatted: list[dict]) -> dict:
 
     _save_tracked(tracked)
     _save_backlog(backlog)
+    _prune_descriptions()
 
     return {
         "new_jobs_found": len(new_entries),
@@ -375,6 +407,10 @@ def _format_waas_results(results: list[dict]) -> list[dict]:
         full_cache.append({**formatted, "full_text": p["full_text"]})
 
     _full_results_cache = full_cache
+
+    # Persist descriptions to disk for fast get_job_details
+    _cache_descriptions(full_cache)
+
     return output
 
 
@@ -500,26 +536,41 @@ def get_job_details(job_url: str) -> str:
         if r.get("job_url") == job_url:
             return json.dumps(r, indent=2)
 
-    # Fall back to fetching the page directly
+    # Check disk cache (persisted across restarts)
+    descs = _load_descriptions()
+    tracked = _load_tracked()
+    backlog = _load_backlog()
+    entry = tracked.get(job_url) or backlog.get(job_url) or {}
+
+    if job_url in descs:
+        return json.dumps({
+            "job_url": job_url,
+            "job_title": entry.get("job_title", ""),
+            "company": entry.get("company", ""),
+            "location": entry.get("location", ""),
+            "remote": entry.get("remote", False),
+            "salary_range": entry.get("salary_range", ""),
+            "seniority": entry.get("seniority", "unknown"),
+            "full_text": descs[job_url],
+        }, indent=2)
+
+    # Last resort: fetch the page directly
     import requests
     try:
         resp = requests.get(job_url, timeout=15, headers={
             "User-Agent": "Mozilla/5.0 (compatible; HNJobScanner/1.0)"
         })
         resp.raise_for_status()
-        # Extract description from the page
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(resp.text, "html.parser")
-        # WAAS job pages have the description in a specific div
         desc_div = soup.select_one(".prose") or soup.select_one("[class*=description]")
         description = desc_div.get_text(separator="\n", strip=True) if desc_div else ""
         title_el = soup.select_one("h1")
         title = title_el.get_text(strip=True) if title_el else ""
 
-        # Check tracked/backlog for metadata
-        tracked = _load_tracked()
-        backlog = _load_backlog()
-        entry = tracked.get(job_url) or backlog.get(job_url) or {}
+        # Cache for next time
+        descs[job_url] = description
+        _save_descriptions(descs)
 
         return json.dumps({
             "job_url": job_url,
@@ -798,8 +849,9 @@ def reset_tracking() -> str:
     _save_json(APPLIED_JOBS_FILE, {})
     _save_json(DISMISSED_JOBS_FILE, {})
     _save_json(LONGSHOT_JOBS_FILE, {})
+    _save_json(JOB_DESCRIPTIONS_FILE, {})
     _save_json(waas.WAAS_SEEN_FILE, {"jobs": {}})
-    return json.dumps({"status": "reset", "files_cleared": 6})
+    return json.dumps({"status": "reset", "files_cleared": 7})
 
 @mcp.tool()
 def get_tracked_jobs() -> str:
@@ -885,6 +937,11 @@ def mark_applied(job_url: str) -> str:
     entry = tracked.pop(job_url)
     entry["status"] = "applied"
     entry["date_applied"] = date.today().isoformat()
+
+    # Preserve full description in applied entry
+    descs = _load_descriptions()
+    if job_url in descs:
+        entry["full_text"] = descs[job_url]
 
     applied = _load_applied()
     applied[job_url] = entry
@@ -1091,6 +1148,7 @@ def validate_tracked_jobs() -> str:
         _save_longshot(longshot)
     if removed_tracked or promoted:
         _save_backlog(backlog)
+    _prune_descriptions()
 
     all_removed = removed_tracked + removed_dismissed + removed_longshot
     total_checked = (len(tracked) + len(removed_tracked)
