@@ -891,7 +891,7 @@ def get_dismissed_jobs() -> str:
 @mcp.tool()
 def update_job_analysis(job_url: str, fit_explanation: str, odds: str,
                         odds_reasoning: str, salary_vs_col: str) -> str:
-    """Write an analysis for a tracked job. Does not overwrite existing analysis.
+    """Write or update an analysis for a tracked job.
 
     Args:
         job_url: The WAAS job URL to update.
@@ -903,9 +903,6 @@ def update_job_analysis(job_url: str, fit_explanation: str, odds: str,
     tracked = _load_tracked()
     if job_url not in tracked:
         return json.dumps({"error": f"Job not tracked: {job_url}"})
-
-    if tracked[job_url]["analysis"] is not None:
-        return json.dumps({"error": "Analysis already exists. Will not overwrite."})
 
     if odds not in ("low", "medium", "high"):
         return json.dumps({"error": f"Invalid odds value: {odds}. Must be low, medium, or high."})
@@ -1048,6 +1045,48 @@ def mark_open(job_url: str) -> str:
         _save_longshot(longshot)
 
     return json.dumps({"status": "open", "job_url": job_url})
+
+
+@mcp.tool()
+def swap_role(job_url: str, new_job_url: str) -> str:
+    """Replace a tracked job with a different role from the same company.
+
+    Keeps the same company metadata but swaps the URL. The old job's
+    analysis is cleared since it applies to the old role. Use
+    get_job_details on the new URL to fetch its full description.
+
+    Args:
+        job_url: The current tracked job URL to replace.
+        new_job_url: The new role URL (typically from other_roles).
+    """
+    tracked = _load_tracked()
+    if job_url not in tracked:
+        return json.dumps({"error": f"Job not tracked: {job_url}"})
+
+    entry = tracked.pop(job_url)
+
+    # Find the new role's title from other_roles if available
+    new_title = ""
+    for role in entry.get("other_roles", []):
+        if role.get("job_url") == new_job_url:
+            new_title = role.get("job_title", "")
+            break
+
+    # Update entry for the new role
+    if new_title:
+        entry["job_title"] = new_title
+    entry["analysis"] = None  # clear — old analysis doesn't apply
+
+    tracked[new_job_url] = entry
+    _save_tracked(tracked)
+
+    return json.dumps({
+        "status": "swapped",
+        "old_url": job_url,
+        "new_url": new_job_url,
+        "job_title": entry.get("job_title", ""),
+        "company": entry.get("company", ""),
+    }, indent=2)
 
 
 @mcp.tool()
