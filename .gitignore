@@ -11,6 +11,7 @@ tracked_jobs.json
 backlog_jobs.json
 applied_jobs.json
 dismissed_jobs.json
+longshot_jobs.json
 .vex/report.json
 .vex/validation.json
 .vex/drift.json

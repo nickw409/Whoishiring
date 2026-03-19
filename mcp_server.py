@@ -37,6 +37,7 @@ TRACKED_JOBS_FILE = _PROJECT_DIR / "tracked_jobs.json"
 BACKLOG_JOBS_FILE = _PROJECT_DIR / "backlog_jobs.json"
 APPLIED_JOBS_FILE = _PROJECT_DIR / "applied_jobs.json"
 DISMISSED_JOBS_FILE = _PROJECT_DIR / "dismissed_jobs.json"
+LONGSHOT_JOBS_FILE = _PROJECT_DIR / "longshot_jobs.json"
 
 DEFAULT_MAX_TRACKED = 20
 
@@ -86,6 +87,14 @@ def _load_dismissed() -> dict:
 
 def _save_dismissed(data: dict) -> None:
     _save_json(DISMISSED_JOBS_FILE, data)
+
+
+def _load_longshot() -> dict:
+    return _load_json(LONGSHOT_JOBS_FILE)
+
+
+def _save_longshot(data: dict) -> None:
+    _save_json(LONGSHOT_JOBS_FILE, data)
 
 
 def _max_tracked() -> int:
@@ -157,7 +166,8 @@ def _track_waas_results(formatted: list[dict]) -> dict:
     dismissed = _load_dismissed()
     max_n = _max_tracked()
 
-    all_known = set(tracked) | set(backlog) | set(applied) | set(dismissed)
+    longshot = _load_longshot()
+    all_known = set(tracked) | set(backlog) | set(applied) | set(dismissed) | set(longshot)
 
     # Build entries for truly new jobs
     new_entries = {}
@@ -787,8 +797,9 @@ def reset_tracking() -> str:
     _save_json(BACKLOG_JOBS_FILE, {})
     _save_json(APPLIED_JOBS_FILE, {})
     _save_json(DISMISSED_JOBS_FILE, {})
+    _save_json(LONGSHOT_JOBS_FILE, {})
     _save_json(waas.WAAS_SEEN_FILE, {"jobs": {}})
-    return json.dumps({"status": "reset", "files_cleared": 5})
+    return json.dumps({"status": "reset", "files_cleared": 6})
 
 @mcp.tool()
 def get_tracked_jobs() -> str:
@@ -929,7 +940,7 @@ def mark_dismissed(job_url: str) -> str:
 
 @mcp.tool()
 def mark_open(job_url: str) -> str:
-    """Move a job from applied or dismissed back to tracked.
+    """Move a job from applied, dismissed, or longshot back to tracked.
 
     If tracked is at capacity, the lowest-score tracked job is demoted
     to the backlog to make room.
@@ -937,9 +948,9 @@ def mark_open(job_url: str) -> str:
     Args:
         job_url: The WAAS job URL to revert to open.
     """
-    # Find the job in applied or dismissed
     applied = _load_applied()
     dismissed = _load_dismissed()
+    longshot = _load_longshot()
     entry = None
     source = None
 
@@ -949,9 +960,12 @@ def mark_open(job_url: str) -> str:
     elif job_url in dismissed:
         entry = dismissed.pop(job_url)
         source = "dismissed"
+    elif job_url in longshot:
+        entry = longshot.pop(job_url)
+        source = "longshot"
 
     if entry is None:
-        return json.dumps({"error": f"Job not found in applied or dismissed: {job_url}"})
+        return json.dumps({"error": f"Job not found in applied, dismissed, or longshot: {job_url}"})
 
     entry["status"] = "open"
     entry["date_applied"] = None
@@ -971,15 +985,63 @@ def mark_open(job_url: str) -> str:
 
     if source == "applied":
         _save_applied(applied)
-    else:
+    elif source == "dismissed":
         _save_dismissed(dismissed)
+    elif source == "longshot":
+        _save_longshot(longshot)
 
     return json.dumps({"status": "open", "job_url": job_url})
 
 
 @mcp.tool()
+def mark_longshot(job_url: str) -> str:
+    """Move a tracked job to longshot_jobs.json.
+
+    Longshots are interesting but unlikely jobs worth keeping visible.
+    Backfills the freed tracked slot from the backlog (highest score first).
+    Returns the newly promoted job if one exists.
+
+    Args:
+        job_url: The WAAS job URL to mark as a longshot.
+    """
+    tracked = _load_tracked()
+    if job_url not in tracked:
+        return json.dumps({"error": f"Job not tracked: {job_url}"})
+
+    entry = tracked.pop(job_url)
+    entry["status"] = "longshot"
+
+    longshot = _load_longshot()
+    longshot[job_url] = entry
+    _save_longshot(longshot)
+
+    # Backfill from backlog
+    backlog = _load_backlog()
+    promoted = _backfill_tracked(tracked, backlog, _max_tracked())
+    _save_tracked(tracked)
+    if promoted:
+        _save_backlog(backlog)
+
+    result = {"status": "longshot", "job_url": job_url, "backfilled": len(promoted)}
+    if promoted:
+        url, entry = promoted[0]
+        result["next_job"] = {"job_url": url, **entry}
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def get_longshot_jobs() -> str:
+    """Return all jobs marked as longshots.
+
+    These are interesting-but-unlikely jobs kept visible for later review.
+    Each entry preserves the full job data including analysis.
+    """
+    return json.dumps(_load_longshot(), indent=2)
+
+
+@mcp.tool()
 def validate_tracked_jobs() -> str:
-    """Check tracked and dismissed jobs, remove any whose listings are no longer live.
+    """Check tracked, dismissed, and longshot jobs. Remove any whose listings are no longer live.
 
     Hits each job's URL to verify the listing still exists. Removes dead
     listings from tracked_jobs.json and dismissed_jobs.json. Backfills
@@ -992,6 +1054,7 @@ def validate_tracked_jobs() -> str:
 
     tracked = _load_tracked()
     dismissed = _load_dismissed()
+    longshot = _load_longshot()
 
     def _check_urls(jobs: dict) -> list[str]:
         dead = []
@@ -1008,11 +1071,14 @@ def validate_tracked_jobs() -> str:
 
     removed_tracked = _check_urls(tracked)
     removed_dismissed = _check_urls(dismissed)
+    removed_longshot = _check_urls(longshot)
 
     for url in removed_tracked:
         del tracked[url]
     for url in removed_dismissed:
         del dismissed[url]
+    for url in removed_longshot:
+        del longshot[url]
 
     # Backfill from backlog
     backlog = _load_backlog()
@@ -1021,16 +1087,21 @@ def validate_tracked_jobs() -> str:
     _save_tracked(tracked)
     if removed_dismissed:
         _save_dismissed(dismissed)
+    if removed_longshot:
+        _save_longshot(longshot)
     if removed_tracked or promoted:
         _save_backlog(backlog)
 
-    all_removed = removed_tracked + removed_dismissed
-    total_checked = len(tracked) + len(removed_tracked) + len(dismissed) + len(removed_dismissed)
+    all_removed = removed_tracked + removed_dismissed + removed_longshot
+    total_checked = (len(tracked) + len(removed_tracked)
+                     + len(dismissed) + len(removed_dismissed)
+                     + len(longshot) + len(removed_longshot))
     return json.dumps({
         "checked": total_checked,
         "validated": total_checked - len(all_removed),
         "removed_tracked": len(removed_tracked),
         "removed_dismissed": len(removed_dismissed),
+        "removed_longshot": len(removed_longshot),
         "removed_jobs": all_removed,
         "backfilled": len(promoted),
     }, indent=2)
