@@ -118,11 +118,11 @@ def _cache_descriptions(formatted: list[dict]) -> None:
 
 
 def _prune_descriptions() -> None:
-    """Remove cached descriptions for jobs not in tracked, backlog, or applied."""
+    """Remove cached descriptions for jobs not in tracked, backlog, applied, or longshot."""
     descs = _load_descriptions()
     if not descs:
         return
-    keep = set(_load_tracked()) | set(_load_backlog()) | set(_load_applied())
+    keep = set(_load_tracked()) | set(_load_backlog()) | set(_load_applied()) | set(_load_longshot())
     pruned = {url: text for url, text in descs.items() if url in keep}
     if len(pruned) < len(descs):
         _save_descriptions(pruned)
@@ -1106,6 +1106,11 @@ def mark_longshot(job_url: str) -> str:
 
     entry = tracked.pop(job_url)
     entry["status"] = "longshot"
+
+    # Preserve full description in longshot entry
+    descs = _load_descriptions()
+    if job_url in descs:
+        entry["full_text"] = descs[job_url]
 
     longshot = _load_longshot()
     longshot[job_url] = entry
