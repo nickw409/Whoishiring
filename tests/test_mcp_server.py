@@ -585,17 +585,19 @@ class TestUpdateJobAnalysis:
         assert analysis["fit_explanation"] == "Good fit"
         assert analysis["odds"] == "high"
 
-    def test_rejects_overwrite(self, tmp_path):
+    def test_allows_overwrite(self, tmp_path):
         f = tmp_path / "tracked.json"
         f.write_text(json.dumps({
-            "https://waas.com/1": {"status": "open", "analysis": {"odds": "low"}}
+            "https://waas.com/1": {"status": "open", "analysis": {"odds": "low", "fit_explanation": "Old", "odds_reasoning": "Old", "salary_vs_col": "Old"}}
         }))
         with patch.object(mcp_server, "TRACKED_JOBS_FILE", f):
             result = json.loads(mcp_server.update_job_analysis(
-                "https://waas.com/1", "New", "high", "New", "New"
+                "https://waas.com/1", "New fit", "high", "New reasoning", "New salary"
             ))
-        assert "error" in result
-        assert "overwrite" in result["error"].lower()
+            data = mcp_server._load_tracked()
+        assert result["status"] == "updated"
+        assert data["https://waas.com/1"]["analysis"]["odds"] == "high"
+        assert data["https://waas.com/1"]["analysis"]["fit_explanation"] == "New fit"
 
     def test_rejects_unknown_job(self, tmp_path):
         f = tmp_path / "tracked.json"
@@ -826,3 +828,66 @@ class TestScanWaasTracking:
         assert "https://waas.com/jobs/2" in tracked
         # Score 1.0 goes to backlog
         assert "https://waas.com/jobs/1" in backlog
+
+
+class TestSwapRole:
+    def test_swaps_url_and_clears_analysis(self, tmp_path):
+        (tmp_path / "tracked.json").write_text(json.dumps({
+            "https://waas.com/jobs/old": {
+                "company": "TestCo", "job_title": "Backend Eng", "score": 5,
+                "status": "open", "analysis": {"odds": "high"},
+                "other_roles": [
+                    {"job_title": "ML Engineer", "job_url": "https://waas.com/jobs/new"},
+                ],
+            }
+        }))
+        with _patch_all_tracking_files(tmp_path):
+            result = json.loads(mcp_server.swap_role(
+                "https://waas.com/jobs/old", "https://waas.com/jobs/new"
+            ))
+            tracked = mcp_server._load_tracked()
+        assert result["status"] == "swapped"
+        assert "https://waas.com/jobs/old" not in tracked
+        assert "https://waas.com/jobs/new" in tracked
+        entry = tracked["https://waas.com/jobs/new"]
+        assert entry["company"] == "TestCo"
+        assert entry["job_title"] == "ML Engineer"
+        assert entry["analysis"] is None
+
+    def test_keeps_company_metadata(self, tmp_path):
+        (tmp_path / "tracked.json").write_text(json.dumps({
+            "https://waas.com/jobs/old": {
+                "company": "TestCo", "yc_batch": "S24", "company_size": "10 people",
+                "job_title": "Eng", "score": 3, "status": "open",
+                "location": "SF", "remote": False, "analysis": None,
+                "other_roles": [],
+            }
+        }))
+        with _patch_all_tracking_files(tmp_path):
+            mcp_server.swap_role("https://waas.com/jobs/old", "https://waas.com/jobs/new")
+            tracked = mcp_server._load_tracked()
+        entry = tracked["https://waas.com/jobs/new"]
+        assert entry["yc_batch"] == "S24"
+        assert entry["company_size"] == "10 people"
+        assert entry["location"] == "SF"
+
+    def test_unknown_url_errors(self, tmp_path):
+        (tmp_path / "tracked.json").write_text("{}")
+        with _patch_all_tracking_files(tmp_path):
+            result = json.loads(mcp_server.swap_role(
+                "https://waas.com/jobs/nope", "https://waas.com/jobs/new"
+            ))
+        assert "error" in result
+
+    def test_new_url_not_in_other_roles_keeps_old_title(self, tmp_path):
+        (tmp_path / "tracked.json").write_text(json.dumps({
+            "https://waas.com/jobs/old": {
+                "company": "TestCo", "job_title": "Backend Eng", "score": 5,
+                "status": "open", "analysis": None, "other_roles": [],
+            }
+        }))
+        with _patch_all_tracking_files(tmp_path):
+            mcp_server.swap_role("https://waas.com/jobs/old", "https://waas.com/jobs/new")
+            tracked = mcp_server._load_tracked()
+        # Title unchanged since new URL wasn't in other_roles
+        assert tracked["https://waas.com/jobs/new"]["job_title"] == "Backend Eng"
