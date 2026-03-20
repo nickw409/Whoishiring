@@ -1,22 +1,20 @@
 # HN "Who's Hiring" Job Scanner
 
-Scans Hacker News monthly "Who is hiring?" threads, filters posts by keyword categories, optionally ranks results against your resume using Claude, and delivers results via HTML email, local file, or Claude Desktop.
+Scans Hacker News monthly "Who is hiring?" threads and YC's Work at a Startup board, filters by keywords/seniority/location/job type, tracks top jobs in a persistent pipeline, and integrates with Claude Desktop for analysis and ranking.
 
 ## Sources
-
-This scanner pulls from two sources:
 
 ### HN Who's Hiring
 - Monthly threads from Hacker News "Ask HN: Who is hiring?"
 - Fetched via Algolia search API
 - Scans current month + configurable history (1-3 months)
 
-### Work at a Startup
+### Work at a Startup (WAAS)
 - YC's job board at workatastartup.com
 - Scraped using Playwright headless browser
-- Always scans current live listings
+- Filterable by role, job type, experience level via config
 
-Both sources use identical keyword filtering and scoring. When using `scan_all`, results are deduplicated by company name with HN listings taking priority.
+Both sources use identical keyword filtering and scoring from `filters.py`.
 
 ## Setup
 
@@ -27,8 +25,6 @@ pip install -r requirements.txt
 ```
 
 ### Config
-
-Copy the example and edit:
 
 ```bash
 cp config.yaml.example config.yaml
@@ -41,41 +37,32 @@ preferences:
   notes: |
     I prefer early-stage startups. Looking to work with Rust or Python.
     Not interested in fintech.
-
-# WAAS Algolia filters (all optional, defaults: role=eng, job_type=fulltime)
+filters:
+  max_seniority: mid       # intern, junior, mid, senior, staff+ (filter out above)
+  coding_only: true         # filter out non-coding roles
+tracking:
+  max_tracked: 20           # max jobs in tracked pipeline (overflow → backlog)
 waas:
-  # role: eng               # eng, sales, operations, marketing, product
-  # eng_type: ml            # fs, be, ml, fe, eng_mgmt, devops, embedded
-  # remote: only            # yes, only, no
-  # job_type: fulltime      # fulltime, intern, contract, cofounder
-  # min_experience: 3       # 0, 1, 3, 6, 11
-  # us_visa_required: none  # yes, none, possible
-  # has_salary: true        # true, false
-  # company_waas_stage: seed  # seed, series_a, growth, scale
+  role: eng                 # eng, sales, operations, marketing, product, any
+  job_type: fulltime        # fulltime, intern, contract, cofounder, any
+  min_experience: "0,1"     # 0, 1, 3, 6, 11, any (comma-separated for OR)
 ```
 
 ### Environment Variables
 
-**For CLI ranking (optional):**
-- `ANTHROPIC_API_KEY` — enables Claude-powered job ranking against your resume
+Add to the project `.env` file (gitignored):
 
-**For email delivery (optional):**
-- `HN_JOBS_EMAIL_TO`
-- `HN_JOBS_EMAIL_FROM`
-- `HN_JOBS_EMAIL_PASSWORD` (Gmail app password)
+| Variable | Purpose |
+|----------|---------|
+| `ANTHROPIC_API_KEY` | Claude API for CLI ranking |
+| `HN_JOBS_EMAIL_TO` | Email recipient |
+| `HN_JOBS_EMAIL_FROM` | Email sender |
+| `HN_JOBS_EMAIL_PASSWORD` | Gmail app password |
+| `WAAS_USERNAME` | YC account for full WAAS access |
+| `WAAS_PASSWORD` | YC account password |
+| `TRACKING_DIR` | Directory for tracking JSON files (keeps paths out of git) |
 
-**For full WAAS access (optional):**
-- `WAAS_USERNAME` — YC account username or email
-- `WAAS_PASSWORD` — YC account password
-
-Without these, WAAS scraping is limited to ~30 jobs. With credentials, all engineering listings are accessible.
-
-Add these to the project `.env` file (already gitignored):
-
-```bash
-echo 'WAAS_USERNAME=your_username' >> .env
-echo 'WAAS_PASSWORD=your_password' >> .env
-```
+Without WAAS credentials, scraping is limited to ~30 jobs.
 
 ## CLI Usage
 
@@ -93,24 +80,20 @@ python3 hn_jobs.py --dry-run --resume /path/to/resume.pdf
 python3 hn_jobs.py
 ```
 
-### Flags
-
 | Flag | Description |
 |------|-------------|
-| `--no-email` | Print results to terminal instead of sending email |
-| `--dry-run` | Save HTML preview to `results/` directory |
-| `--resume PDF` | Path to resume PDF (overrides config.yaml) |
-| `--no-rank` | Skip Claude ranking, use keyword score ordering |
+| `--no-email` | Print results to terminal |
+| `--dry-run` | Save HTML preview to `results/` |
+| `--resume PDF` | Override config resume path |
+| `--no-rank` | Skip Claude ranking |
 
 ## Claude Desktop (MCP Server)
 
-The MCP server lets Claude Desktop scan and rank jobs directly in conversation — no API key needed since Claude Desktop is the ranker.
+The MCP server exposes the full scan and job tracking pipeline to Claude Desktop via stdio transport. Claude Desktop acts as the ranker — no API key needed.
 
 ### Setup
 
-Add to your Claude Desktop config (`claude_desktop_config.json`).
-
-On WSL, use `bash -c` to source the `.env` file so credentials stay out of the config:
+Add to `claude_desktop_config.json`. On WSL, use `bash -c` to source `.env`:
 
 ```json
 {
@@ -127,89 +110,94 @@ On WSL, use `bash -c` to source the `.env` file so credentials stay out of the c
 }
 ```
 
-If not on WSL:
-
-```json
-{
-  "mcpServers": {
-    "hn-jobs": {
-      "type": "stdio",
-      "command": "bash",
-      "args": [
-        "-c",
-        "set -a; source /path/to/project/.env; set +a; /path/to/project/.venv/bin/python3 /path/to/project/mcp_server.py"
-      ]
-    }
-  }
-}
-```
-
-Restart Claude Desktop after adding the config.
-
-### Tools
+### Scanning Tools
 
 | Tool | Description |
 |------|-------------|
-| `scan_jobs` | Run the full scan pipeline. Args: `months` (1-3), `ignore_seen` (skip dedup) |
-| `scan_waas` | Scan Work at a Startup for matching jobs. Args: `ignore_seen` |
-| `scan_all` | Scan both HN and WAAS, deduplicate by company. Args: `months`, `ignore_seen` |
-| `get_resume` | Extract and return resume text from configured PDF |
-| `get_preferences` | Return job preferences from config.yaml |
-| `get_latest_results` | Return most recent saved results without re-scanning |
+| `scan_jobs(months, ignore_seen)` | Scan HN threads, return results |
+| `scan_waas(ignore_seen, group_by_company)` | Scan WAAS, auto-track top N jobs. Returns run metadata only |
+| `scan_all(ignore_seen, months, group_by_company)` | Scan both sources, dedup by company (HN priority) |
+| `get_job_details(job_url)` | Get full job description (cached on disk, falls back to HTTP) |
 
-### Prompts
+### Job Tracking Tools
 
-The MCP server registers prompt templates (`find_jobs`, `rerank_results`, `scan_overview`, `backfill`) that should appear as slash commands in the client. **Note:** As of March 2026, Claude Desktop (claude.ai) does not surface MCP prompts in its UI. The prompts are returned via `prompts/list` but the client ignores them. Use the example prompts below manually instead.
+Jobs flow through a persistent pipeline stored in JSON files at `TRACKING_DIR`:
 
-### Example Prompts
+| Tool | Description |
+|------|-------------|
+| `get_tracked_jobs()` | Active pipeline — top N open jobs (with or without analysis) |
+| `get_applied_jobs()` | Jobs marked as applied |
+| `get_dismissed_jobs()` | Jobs marked as dismissed |
+| `get_longshot_jobs()` | Interesting but unlikely jobs worth keeping visible |
+| `update_job_analysis(job_url, ...)` | Write fit analysis for a tracked job |
+| `mark_applied(job_url)` | Move tracked → applied, backfill from backlog. Returns promoted job |
+| `mark_dismissed(job_url)` | Move tracked → dismissed, backfill from backlog. Returns promoted job |
+| `mark_longshot(job_url)` | Move tracked → longshot, backfill from backlog. Returns promoted job |
+| `mark_open(job_url)` | Move applied/dismissed/longshot → tracked (demotes lowest score if at cap) |
+| `swap_role(job_url, new_job_url)` | Replace a tracked job with an alternate role from the same company |
+| `validate_tracked_jobs()` | Check open/dismissed/longshot jobs against WAAS, remove dead, backfill |
+| `reset_tracking()` | Clear all tracking files and seen_waas (requires server restart) |
 
-**Full scan with ranking:**
-> Use get_resume and get_preferences to understand my background, then scan_jobs with ignore_seen=true to find this month's matching positions. Rank every job from best to worst fit and give me your top 15 with a reason for each.
+### Config & Resume Tools
 
-**Re-rank previous results:**
-> Get my resume and preferences, then use get_latest_results to load the previous scan. Rank the results for me and give me your top 10.
+| Tool | Description |
+|------|-------------|
+| `get_resume()` | Extract resume text from configured PDF |
+| `get_preferences()` | Return preferences from config.yaml |
+| `get_config()` | Return full config |
+| `update_config(...)` | Update config.yaml settings |
+| `get_latest_results()` | Return most recent saved results JSON |
 
-**Quick scan without ranking:**
-> Scan for this month's jobs with ignore_seen=true and summarize what's out there. Group them by category.
+### Job Tracking Pipeline
 
-**Scan multiple months:**
-> Scan the last 3 months of jobs with months=3 and ignore_seen=true. Find anything that's a strong fit for my resume.
+Six JSON files at `TRACKING_DIR`, keyed by WAAS job URL:
 
-**YC startups only:**
-> Use scan_waas with ignore_seen=true to find engineering jobs from YC startups. Get my resume and rank the results by fit.
+- **`tracked_jobs.json`** — Active pipeline, max N jobs (default 20). Filled by score from backlog.
+- **`backlog_jobs.json`** — Overflow jobs ranked by score, waiting for a tracked slot.
+- **`applied_jobs.json`** — Moved from tracked by `mark_applied`. Permanent, not validated.
+- **`dismissed_jobs.json`** — Moved from tracked by `mark_dismissed`. Validated (dead listings removed).
+- **`longshot_jobs.json`** — Moved from tracked by `mark_longshot`. Validated (dead listings removed).
+- **`job_descriptions.json`** — Cached full descriptions. Auto-pruned when jobs leave tracked/backlog/applied/longshot.
 
-**YC startups deep scan with artifact:**
-> Use get_resume and get_preferences to understand my background, then scan_waas with ignore_seen=true. Filter to seniority levels matching 0-1 years experience (junior, junior-mid, mid, any, unknown — exclude senior, staff+, intern). Filter out non-code roles. Use get_job_details on your top candidates to read full descriptions before ranking. Rank your top 20 by fit against my resume. For each, show: company name, YC batch, job title, seniority level, salary range, location, remote status, WAAS job URL, a detailed explanation connecting my specific resume experience to the role's requirements, your estimated odds of getting the job (low/medium/high with reasoning based on how well my experience matches their requirements), and a comparison of the listed salary against the livable salary for that location (or note if remote). If a company has other_roles, mention them briefly. Put it all in an artifact.
+Each tracked entry: company, yc_batch, company_size, job_title, seniority, salary_range, location, remote, other_roles, score, status, date_added, date_applied, analysis.
 
-**Targeted search:**
-> Scan for jobs, get my resume, and find roles that specifically mention Rust or systems programming. Which ones would be the best fit?
+### Daily Workflow
+
+1. `validate_tracked_jobs` — remove dead listings, backfill from backlog
+2. `scan_waas` — discover new jobs, auto-track top N by score
+3. `get_tracked_jobs` — find unanalyzed jobs (analysis = null)
+4. For each: `get_job_details` → `update_job_analysis` (or `mark_dismissed`/`mark_longshot` if poor fit)
+5. Display tracked/applied/dismissed/longshot in React artifact
+
+### Filters
+
+All filters apply during scanning before jobs enter tracking:
+
+- **Keywords** — scored by category: AI tooling (3), Systems (2), General AI+SWE (1)
+- **Negative keywords** — staff/principal/director/VP/10+ years → filtered out
+- **Seniority** — configurable max level (intern/junior/mid/senior/staff+)
+- **Job type** — coding vs non-coding (engineering management = non-coding)
+- **Location** — non-US, non-remote jobs filtered out
+
+Active filters are included in `scan_waas` response metadata.
 
 ## How It Works
 
-1. **Find threads** — queries Algolia for recent "Who is hiring?" posts by `whoishiring`
-2. **Fetch comments** — pulls all top-level comments (parallelized, 20 workers)
-3. **Keyword matching** — scores posts by category (AI tooling=3, Systems=2, General AI+SWE=1)
-4. **Negative filter** — posts matching senior/management keywords go to "Filtered Out" section
-5. **Location filter** — non-US, non-remote jobs are filtered out
-6. **Job board scraping** — extracts job titles from Greenhouse, Lever, Ashby links
-7. **Claude ranking** (optional) — sends all results + resume to Claude, re-orders by fit
-8. **Output** — HTML email, local HTML file, terminal, or Claude Desktop conversation
-
-### First Run
-
-On first run (empty `seen_posts.json`), scans the current month plus 2 prior months. Subsequent runs scan only the latest thread and skip already-seen posts. Use `ignore_seen=true` in the MCP server to bypass this.
-
-## Output
-
-- `results/preview_<timestamp>.html` — browsable HTML (with `--dry-run`)
-- `results/results_<timestamp>.json` — structured JSON (always saved)
+1. **Find threads** — queries Algolia for recent "Who is hiring?" posts
+2. **Fetch comments** — pulls top-level comments (parallelized, 20 workers)
+3. **Keyword matching** — scores posts by category
+4. **Filter cascade** — negative keywords → seniority → job type → location
+5. **Job board scraping** — extracts titles from Greenhouse, Lever, Ashby links
+6. **Tracking** — top N by score enter tracked pipeline, rest go to backlog
+7. **Analysis** — Claude Desktop analyzes each tracked job against resume
+8. **Output** — React artifact, HTML email, local file, or terminal
 
 ## Dependencies
 
 - `requests` — HN API + job board scraping
-- `pyyaml` — config file loading
-- `pymupdf` — PDF resume text extraction
-- `anthropic` — Claude API for CLI ranking
-- `playwright` — headless browser for WAAS scraping
-- `beautifulsoup4` — HTML parsing for WAAS page
-- `mcp` — MCP server for Claude Desktop integration
+- `pyyaml` — config loading
+- `pymupdf` — PDF resume extraction
+- `anthropic` — Claude API (CLI ranking only)
+- `playwright` — headless browser for WAAS
+- `beautifulsoup4` — HTML parsing
+- `mcp` — MCP server for Claude Desktop
