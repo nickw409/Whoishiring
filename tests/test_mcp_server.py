@@ -621,7 +621,7 @@ class TestUpdateJobAnalysis:
 
 
 def _patch_all_tracking_files(tmp_path):
-    """Return a context manager that patches all 4 tracking file paths to tmp_path."""
+    """Return a context manager that patches all tracking file paths to tmp_path."""
     from contextlib import contextmanager
 
     @contextmanager
@@ -629,7 +629,10 @@ def _patch_all_tracking_files(tmp_path):
         with patch.object(mcp_server, "TRACKED_JOBS_FILE", tmp_path / "tracked.json"), \
              patch.object(mcp_server, "BACKLOG_JOBS_FILE", tmp_path / "backlog.json"), \
              patch.object(mcp_server, "APPLIED_JOBS_FILE", tmp_path / "applied.json"), \
-             patch.object(mcp_server, "DISMISSED_JOBS_FILE", tmp_path / "dismissed.json"):
+             patch.object(mcp_server, "DISMISSED_JOBS_FILE", tmp_path / "dismissed.json"), \
+             patch.object(mcp_server, "LONGSHOT_JOBS_FILE", tmp_path / "longshot.json"), \
+             patch.object(mcp_server, "REJECTED_JOBS_FILE", tmp_path / "rejected.json"), \
+             patch.object(mcp_server, "ACCEPTED_JOBS_FILE", tmp_path / "accepted.json"):
             yield
     return _ctx()
 
@@ -712,6 +715,68 @@ class TestMarkStatus:
         with _patch_all_tracking_files(tmp_path):
             result = json.loads(mcp_server.mark_applied("https://waas.com/nope"))
         assert "error" in result
+
+    def test_mark_rejected_moves_from_applied(self, tmp_path):
+        (tmp_path / "applied.json").write_text(json.dumps({
+            "https://waas.com/1": {"status": "applied", "date_applied": "2026-03-18", "score": 3}
+        }))
+        with _patch_all_tracking_files(tmp_path):
+            result = json.loads(mcp_server.mark_rejected("https://waas.com/1"))
+            applied = mcp_server._load_applied()
+            rejected = mcp_server._load_rejected()
+        assert result["status"] == "rejected"
+        assert "https://waas.com/1" not in applied
+        assert "https://waas.com/1" in rejected
+        assert rejected["https://waas.com/1"]["status"] == "rejected"
+
+    def test_mark_rejected_errors_if_not_applied(self, tmp_path):
+        with _patch_all_tracking_files(tmp_path):
+            result = json.loads(mcp_server.mark_rejected("https://waas.com/nope"))
+        assert "error" in result
+
+    def test_mark_accepted_moves_from_applied(self, tmp_path):
+        (tmp_path / "applied.json").write_text(json.dumps({
+            "https://waas.com/1": {"status": "applied", "date_applied": "2026-03-18", "score": 3}
+        }))
+        with _patch_all_tracking_files(tmp_path):
+            result = json.loads(mcp_server.mark_accepted("https://waas.com/1"))
+            applied = mcp_server._load_applied()
+            accepted = mcp_server._load_accepted()
+        assert result["status"] == "accepted"
+        assert "https://waas.com/1" not in applied
+        assert "https://waas.com/1" in accepted
+        assert accepted["https://waas.com/1"]["status"] == "accepted"
+
+    def test_mark_accepted_errors_if_not_applied(self, tmp_path):
+        with _patch_all_tracking_files(tmp_path):
+            result = json.loads(mcp_server.mark_accepted("https://waas.com/nope"))
+        assert "error" in result
+
+    def test_mark_open_moves_from_rejected(self, tmp_path):
+        (tmp_path / "tracked.json").write_text("{}")
+        (tmp_path / "rejected.json").write_text(json.dumps({
+            "https://waas.com/1": {"status": "rejected", "date_applied": "2026-03-18", "score": 3}
+        }))
+        with _patch_all_tracking_files(tmp_path):
+            result = json.loads(mcp_server.mark_open("https://waas.com/1"))
+            tracked = mcp_server._load_tracked()
+            rejected = mcp_server._load_rejected()
+        assert result["status"] == "open"
+        assert "https://waas.com/1" in tracked
+        assert "https://waas.com/1" not in rejected
+
+    def test_mark_open_moves_from_accepted(self, tmp_path):
+        (tmp_path / "tracked.json").write_text("{}")
+        (tmp_path / "accepted.json").write_text(json.dumps({
+            "https://waas.com/1": {"status": "accepted", "date_applied": "2026-03-18", "score": 3}
+        }))
+        with _patch_all_tracking_files(tmp_path):
+            result = json.loads(mcp_server.mark_open("https://waas.com/1"))
+            tracked = mcp_server._load_tracked()
+            accepted = mcp_server._load_accepted()
+        assert result["status"] == "open"
+        assert "https://waas.com/1" in tracked
+        assert "https://waas.com/1" not in accepted
 
 
 class TestValidateTrackedJobs:

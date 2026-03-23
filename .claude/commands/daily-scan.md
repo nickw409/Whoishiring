@@ -14,15 +14,17 @@
      - **odds**: "low", "medium", or "high" — how likely the user is to get this job given ~1 year professional experience, BS CS Dec 2024, and the specific requirements listed.
      - **odds_reasoning**: Why you picked that level. Be honest.
      - **salary_vs_col**: Compare salary against livable for the job's location. Baselines: ~$75K SoCal, ~$95-110K SF, ~$95-120K NYC, ~$80-90K Seattle. If remote, note user lives in Laguna Niguel, CA with no relocation cost.
-6. Call `get_tracked_jobs`, `get_applied_jobs`, `get_dismissed_jobs`, and `get_longshot_jobs`. Create the tracker artifact using the React template from the job-tracker skill found in the job-tracker dir inside C:\Users\nwile\OneDrive\Documents\claude-cowork. Embed all four datasets:
+6. Call `get_tracked_jobs`, `get_applied_jobs`, `get_dismissed_jobs`, `get_longshot_jobs`, `get_rejected_jobs`, and `get_accepted_jobs`. Create the tracker artifact using the React template from the job-tracker skill found in the job-tracker dir inside C:\Users\nwile\OneDrive\Documents\claude-cowork. Embed all six datasets:
    ```
    const TRACKED = [...]   // from get_tracked_jobs
    const APPLIED = [...]   // from get_applied_jobs
    const DISMISSED = [...] // from get_dismissed_jobs
    const LONGSHOT = [...]  // from get_longshot_jobs
+   const REJECTED = [...]  // from get_rejected_jobs
+   const ACCEPTED = [...]  // from get_accepted_jobs
    ```
    The React UI code is identical every run — only the data consts change.
 
-The tracker is read-only (no action buttons). Status changes (apply, dismiss, longshot, reopen) are done via chat — the user tells Claude and Claude calls the MCP tools (`mark_applied`, `mark_dismissed`, `mark_longshot`, `mark_open`).
+The tracker is read-only (no action buttons). Status changes (apply, dismiss, longshot, reject, accept, reopen) are done via chat — the user tells Claude and Claude calls the MCP tools (`mark_applied`, `mark_dismissed`, `mark_longshot`, `mark_rejected`, `mark_accepted`, `mark_open`).
 
 Do NOT re-analyze jobs that already have analysis. Do NOT re-filter what the server already filtered. Unanalyzed jobs only appear when the server promotes from backlog or appends from a new scan.

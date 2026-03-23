@@ -38,6 +38,8 @@ BACKLOG_JOBS_FILE = _PROJECT_DIR / "backlog_jobs.json"
 APPLIED_JOBS_FILE = _PROJECT_DIR / "applied_jobs.json"
 DISMISSED_JOBS_FILE = _PROJECT_DIR / "dismissed_jobs.json"
 LONGSHOT_JOBS_FILE = _PROJECT_DIR / "longshot_jobs.json"
+REJECTED_JOBS_FILE = _PROJECT_DIR / "rejected_jobs.json"
+ACCEPTED_JOBS_FILE = _PROJECT_DIR / "accepted_jobs.json"
 JOB_DESCRIPTIONS_FILE = _PROJECT_DIR / "job_descriptions.json"
 
 DEFAULT_MAX_TRACKED = 20
@@ -98,6 +100,22 @@ def _save_longshot(data: dict) -> None:
     _save_json(LONGSHOT_JOBS_FILE, data)
 
 
+def _load_rejected() -> dict:
+    return _load_json(REJECTED_JOBS_FILE)
+
+
+def _save_rejected(data: dict) -> None:
+    _save_json(REJECTED_JOBS_FILE, data)
+
+
+def _load_accepted() -> dict:
+    return _load_json(ACCEPTED_JOBS_FILE)
+
+
+def _save_accepted(data: dict) -> None:
+    _save_json(ACCEPTED_JOBS_FILE, data)
+
+
 def _load_descriptions() -> dict:
     return _load_json(JOB_DESCRIPTIONS_FILE)
 
@@ -122,7 +140,8 @@ def _prune_descriptions() -> None:
     descs = _load_descriptions()
     if not descs:
         return
-    keep = set(_load_tracked()) | set(_load_backlog()) | set(_load_applied()) | set(_load_longshot())
+    keep = (set(_load_tracked()) | set(_load_backlog()) | set(_load_applied())
+            | set(_load_longshot()) | set(_load_rejected()) | set(_load_accepted()))
     pruned = {url: text for url, text in descs.items() if url in keep}
     if len(pruned) < len(descs):
         _save_descriptions(pruned)
@@ -198,7 +217,10 @@ def _track_waas_results(formatted: list[dict]) -> dict:
     max_n = _max_tracked()
 
     longshot = _load_longshot()
-    all_known = set(tracked) | set(backlog) | set(applied) | set(dismissed) | set(longshot)
+    rejected = _load_rejected()
+    accepted = _load_accepted()
+    all_known = (set(tracked) | set(backlog) | set(applied) | set(dismissed)
+                 | set(longshot) | set(rejected) | set(accepted))
 
     # Build entries for truly new jobs
     new_entries = {}
@@ -1009,7 +1031,7 @@ def mark_dismissed(job_url: str) -> str:
 
 @mcp.tool()
 def mark_open(job_url: str) -> str:
-    """Move a job from applied, dismissed, or longshot back to tracked.
+    """Move a job from applied, dismissed, longshot, rejected, or accepted back to tracked.
 
     If tracked is at capacity, the lowest-score tracked job is demoted
     to the backlog to make room.
@@ -1020,6 +1042,8 @@ def mark_open(job_url: str) -> str:
     applied = _load_applied()
     dismissed = _load_dismissed()
     longshot = _load_longshot()
+    rejected = _load_rejected()
+    accepted = _load_accepted()
     entry = None
     source = None
 
@@ -1032,9 +1056,15 @@ def mark_open(job_url: str) -> str:
     elif job_url in longshot:
         entry = longshot.pop(job_url)
         source = "longshot"
+    elif job_url in rejected:
+        entry = rejected.pop(job_url)
+        source = "rejected"
+    elif job_url in accepted:
+        entry = accepted.pop(job_url)
+        source = "accepted"
 
     if entry is None:
-        return json.dumps({"error": f"Job not found in applied, dismissed, or longshot: {job_url}"})
+        return json.dumps({"error": f"Job not found in applied, dismissed, longshot, rejected, or accepted: {job_url}"})
 
     entry["status"] = "open"
     entry["date_applied"] = None
@@ -1058,6 +1088,10 @@ def mark_open(job_url: str) -> str:
         _save_dismissed(dismissed)
     elif source == "longshot":
         _save_longshot(longshot)
+    elif source == "rejected":
+        _save_rejected(rejected)
+    elif source == "accepted":
+        _save_accepted(accepted)
 
     return json.dumps({"status": "open", "job_url": job_url})
 
@@ -1153,6 +1187,68 @@ def get_longshot_jobs() -> str:
     Each entry preserves the full job data including analysis.
     """
     return json.dumps(_load_longshot(), indent=2)
+
+
+@mcp.tool()
+def mark_rejected(job_url: str) -> str:
+    """Move an applied job to rejected_jobs.json with status "rejected".
+
+    Args:
+        job_url: The WAAS job URL to mark as rejected.
+    """
+    applied = _load_applied()
+    if job_url not in applied:
+        return json.dumps({"error": f"Job not in applied: {job_url}"})
+
+    entry = applied.pop(job_url)
+    entry["status"] = "rejected"
+
+    rejected = _load_rejected()
+    rejected[job_url] = entry
+    _save_rejected(rejected)
+    _save_applied(applied)
+
+    return json.dumps({"status": "rejected", "job_url": job_url})
+
+
+@mcp.tool()
+def mark_accepted(job_url: str) -> str:
+    """Move an applied job to accepted_jobs.json with status "accepted".
+
+    Args:
+        job_url: The WAAS job URL to mark as accepted.
+    """
+    applied = _load_applied()
+    if job_url not in applied:
+        return json.dumps({"error": f"Job not in applied: {job_url}"})
+
+    entry = applied.pop(job_url)
+    entry["status"] = "accepted"
+
+    accepted = _load_accepted()
+    accepted[job_url] = entry
+    _save_accepted(accepted)
+    _save_applied(applied)
+
+    return json.dumps({"status": "accepted", "job_url": job_url})
+
+
+@mcp.tool()
+def get_rejected_jobs() -> str:
+    """Return all jobs that were rejected after applying.
+
+    Each entry preserves the full job data including analysis.
+    """
+    return json.dumps(_load_rejected(), indent=2)
+
+
+@mcp.tool()
+def get_accepted_jobs() -> str:
+    """Return all jobs where an offer/acceptance was received.
+
+    Each entry preserves the full job data including analysis.
+    """
+    return json.dumps(_load_accepted(), indent=2)
 
 
 @mcp.tool()

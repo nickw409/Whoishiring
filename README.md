@@ -1,6 +1,6 @@
 # HN "Who's Hiring" Job Scanner
 
-An automated job discovery and tracking pipeline that scrapes multiple sources, applies a multi-stage filter cascade, and exposes a 20-tool MCP server so Claude Desktop can analyze job fit against a resume — all without requiring an API key.
+An automated job discovery and tracking pipeline that scrapes multiple sources, applies a multi-stage filter cascade, and exposes a 24-tool MCP server so Claude Desktop can analyze job fit against a resume — all without requiring an API key.
 
 ## What It Does
 
@@ -12,8 +12,8 @@ Aggregates job postings from two sources (Hacker News "Who is hiring?" threads v
   Algolia API ──→ hn_jobs.py ──┐
                                ├──→ filters.py ──→ mcp_server.py ──→ Claude Desktop
   Playwright  ──→ waas.py   ──┘         │              │
-                                    Shared filter    20 MCP tools
-                                    pipeline         6 JSON stores
+                                    Shared filter    24 MCP tools
+                                    pipeline         8 JSON stores
                                                      Description cache
 ```
 
@@ -39,7 +39,7 @@ Five-stage filter cascade, each with configurable behavior:
 
 ### Bounded Job Tracking System
 
-Six JSON files managed atomically (read-modify-write) by the MCP server:
+Eight JSON files managed atomically (read-modify-write) by the MCP server:
 
 ```
 scan_waas ──→ [all new jobs] ──→ backlog_jobs.json (overflow, ranked by score)
@@ -51,18 +51,24 @@ scan_waas ──→ [all new jobs] ──→ backlog_jobs.json (overflow, ranked
                           ▼              ▼              ▼
                    applied_jobs    dismissed_jobs  longshot_jobs
                    (permanent)     (validated)     (validated)
+                          │
+                    ┌─────┴─────┐
+                    ▼           ▼
+             rejected_jobs  accepted_jobs
+             (outcome)      (outcome)
 ```
 
 - **Tracked** — Bounded active pipeline (max N, configurable). Only the highest-scoring jobs from backlog fill these slots. Every `mark_applied`, `mark_dismissed`, or `mark_longshot` call frees a slot and auto-promotes the top backlog entry, returning the promoted job in the response to avoid redundant `get_tracked_jobs` calls.
 - **Backlog** — Unbounded overflow, sorted by keyword score. Jobs that pass all filters but don't make the top N cut. Promotion happens automatically when tracked slots open.
 - **Applied** — Permanent record. Not validated against WAAS (job might be filled but the application record matters).
 - **Dismissed / Longshot** — Validated periodically against WAAS — dead listings are pruned automatically.
+- **Rejected / Accepted** — Outcome tracking for applied jobs. `mark_rejected` and `mark_accepted` move jobs from applied to their respective stores. Both can be reverted to tracked via `mark_open`.
 
 ### Description Caching
 
-Full job descriptions are cached to disk during scanning (`job_descriptions.json`). `get_job_details` reads from cache first, falls back to live HTTP + BeautifulSoup parsing. Cache is auto-pruned — descriptions are removed when jobs leave all active stores (tracked, backlog, applied, longshot). Applied jobs retain their descriptions permanently.
+Full job descriptions are cached to disk during scanning (`job_descriptions.json`). `get_job_details` reads from cache first, falls back to live HTTP + BeautifulSoup parsing. Cache is auto-pruned — descriptions are removed when jobs leave all active stores (tracked, backlog, applied, longshot, rejected, accepted). Applied/rejected/accepted jobs retain their descriptions permanently.
 
-### MCP Server (20 Tools)
+### MCP Server (24 Tools)
 
 Stdio-transport MCP server for Claude Desktop. Claude Desktop acts as the LLM ranker, eliminating the need for an API key. The server owns all state — Claude never writes to JSON files directly, only through tool calls.
 
@@ -71,10 +77,11 @@ Stdio-transport MCP server for Claude Desktop. Claude Desktop acts as the LLM ra
 - `scan_all` combines HN + WAAS with cross-source dedup by company name (case-insensitive, whitespace-stripped). HN takes priority.
 - `get_job_details` serves from disk cache, falls back to live fetch with structured extraction (JSON-LD → Open Graph → meta tags → title tag).
 
-**Tracking**: `get_tracked_jobs`, `get_applied_jobs`, `get_dismissed_jobs`, `get_longshot_jobs`, `update_job_analysis`, `mark_applied`, `mark_dismissed`, `mark_longshot`, `mark_open`, `swap_role`, `validate_tracked_jobs`, `reset_tracking`
+**Tracking**: `get_tracked_jobs`, `get_applied_jobs`, `get_dismissed_jobs`, `get_longshot_jobs`, `get_rejected_jobs`, `get_accepted_jobs`, `update_job_analysis`, `mark_applied`, `mark_dismissed`, `mark_longshot`, `mark_rejected`, `mark_accepted`, `mark_open`, `swap_role`, `validate_tracked_jobs`, `reset_tracking`
 - `swap_role` replaces a tracked job with an alternate role URL from the same company (e.g., a better-fit position discovered through `other_roles`), clearing stale analysis.
 - `validate_tracked_jobs` checks open/dismissed/longshot jobs against WAAS, removes dead listings, and backfills from backlog.
-- `mark_*` tools return the newly promoted backlog job inline, enabling a dismiss-and-analyze loop without re-fetching the full tracked list.
+- `mark_applied`/`mark_dismissed`/`mark_longshot` free a tracked slot and return the newly promoted backlog job inline, enabling a dismiss-and-analyze loop without re-fetching the full tracked list.
+- `mark_rejected`/`mark_accepted` move applied jobs to outcome tracking. Both can be reverted via `mark_open`.
 
 **Config**: `get_resume`, `get_preferences`, `get_config`, `update_config`, `get_latest_results`
 - `get_resume` extracts text from a configured PDF via PyMuPDF.
@@ -85,7 +92,7 @@ Stdio-transport MCP server for Claude Desktop. Claude Desktop acts as the LLM ra
 1. `validate_tracked_jobs` — prune dead listings from tracked/dismissed/longshot, backfill from backlog
 2. `scan_waas` — discover new jobs, auto-track top N by score, overflow to backlog
 3. `get_tracked_jobs` → for each unanalyzed job: `get_job_details` → `update_job_analysis` (or `mark_dismissed`/`mark_longshot` with inline backfill loop)
-4. Render tracked/applied/dismissed/longshot into a React artifact
+4. Render tracked/applied/dismissed/longshot/rejected/accepted into a React artifact
 
 ### Deduplication
 
@@ -105,7 +112,7 @@ Stdio-transport MCP server for Claude Desktop. Claude Desktop acts as the LLM ra
 | LLM integration | `anthropic` (CLI) / MCP stdio (Desktop) | Resume-based job ranking |
 | MCP server | `mcp` (FastMCP) | 20-tool stdio server for Claude Desktop |
 | Filter pipeline | `re` (compiled word-boundary regex) | Shared across both sources |
-| State management | JSON files (atomic read-modify-write) | 6 tracking stores + description cache |
+| State management | JSON files (atomic read-modify-write) | 8 tracking stores + description cache |
 
 ## Setup
 
