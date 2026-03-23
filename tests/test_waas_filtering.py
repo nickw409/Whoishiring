@@ -754,8 +754,8 @@ class TestAsyncioFallback:
         assert len(jobs) == 1
         assert jobs[0]["company_name"] == "Test"
 
-    def test_subprocess_failure_returns_empty(self, monkeypatch):
-        from waas import _scrape_via_subprocess
+    def test_subprocess_failure_raises_waas_error(self, monkeypatch):
+        from waas import WaasError, _scrape_via_subprocess
 
         def mock_run(args, **kwargs):
             result = MagicMock()
@@ -765,11 +765,11 @@ class TestAsyncioFallback:
             return result
 
         monkeypatch.setattr("subprocess.run", mock_run)
-        jobs = _scrape_via_subprocess(ignore_seen=True)
-        assert jobs == []
+        with pytest.raises(WaasError, match="crash"):
+            _scrape_via_subprocess(ignore_seen=True)
 
-    def test_subprocess_invalid_json_returns_empty(self, monkeypatch):
-        from waas import _scrape_via_subprocess
+    def test_subprocess_invalid_json_raises_waas_error(self, monkeypatch):
+        from waas import WaasError, _scrape_via_subprocess
 
         def mock_run(args, **kwargs):
             result = MagicMock()
@@ -779,19 +779,19 @@ class TestAsyncioFallback:
             return result
 
         monkeypatch.setattr("subprocess.run", mock_run)
-        jobs = _scrape_via_subprocess(ignore_seen=True)
-        assert jobs == []
+        with pytest.raises(WaasError, match="invalid JSON"):
+            _scrape_via_subprocess(ignore_seen=True)
 
-    def test_subprocess_timeout_returns_empty(self, monkeypatch):
+    def test_subprocess_timeout_raises_waas_error(self, monkeypatch):
         import subprocess as sp
-        from waas import _scrape_via_subprocess
+        from waas import WaasError, _scrape_via_subprocess
 
         def mock_run(args, **kwargs):
             raise sp.TimeoutExpired(args, 300)
 
         monkeypatch.setattr("subprocess.run", mock_run)
-        jobs = _scrape_via_subprocess(ignore_seen=True)
-        assert jobs == []
+        with pytest.raises(WaasError, match="timed out"):
+            _scrape_via_subprocess(ignore_seen=True)
 
 
 # ---------------------------------------------------------------------------
@@ -799,27 +799,26 @@ class TestAsyncioFallback:
 # ---------------------------------------------------------------------------
 
 class TestScrapeViaApi:
-    def test_no_credentials_returns_empty(self, monkeypatch):
-        from waas import _scrape_via_api
+    def test_no_credentials_raises_waas_error(self, monkeypatch):
+        from waas import WaasError, _scrape_via_api
         monkeypatch.delenv("WAAS_USERNAME", raising=False)
         monkeypatch.delenv("WAAS_PASSWORD", raising=False)
-        companies, key = _scrape_via_api()
-        assert companies == []
-        assert key == ""
+        with pytest.raises(WaasError, match="WAAS_USERNAME/WAAS_PASSWORD not set"):
+            _scrape_via_api()
 
-    def test_empty_username_returns_empty(self, monkeypatch):
-        from waas import _scrape_via_api
+    def test_empty_username_raises_waas_error(self, monkeypatch):
+        from waas import WaasError, _scrape_via_api
         monkeypatch.setenv("WAAS_USERNAME", "")
         monkeypatch.setenv("WAAS_PASSWORD", "secret")
-        companies, key = _scrape_via_api()
-        assert companies == []
+        with pytest.raises(WaasError, match="WAAS_USERNAME/WAAS_PASSWORD not set"):
+            _scrape_via_api()
 
-    def test_empty_password_returns_empty(self, monkeypatch):
-        from waas import _scrape_via_api
+    def test_empty_password_raises_waas_error(self, monkeypatch):
+        from waas import WaasError, _scrape_via_api
         monkeypatch.setenv("WAAS_USERNAME", "user")
         monkeypatch.setenv("WAAS_PASSWORD", "")
-        companies, key = _scrape_via_api()
-        assert companies == []
+        with pytest.raises(WaasError, match="WAAS_USERNAME/WAAS_PASSWORD not set"):
+            _scrape_via_api()
 
 
 # ---------------------------------------------------------------------------
@@ -1325,7 +1324,7 @@ class TestWaasPlaywrightIntegration:
         assert key == "algolia-key-123"
 
     def test_yc_login_failure(self):
-        from waas import _scrape_via_api
+        from waas import WaasError, _scrape_via_api
         page = self._mock_page()
         page.url = "https://account.ycombinator.com/authenticate"  # still on auth page = failure
 
@@ -1341,10 +1340,8 @@ class TestWaasPlaywrightIntegration:
         with patch.dict("os.environ", {"WAAS_USERNAME": "user", "WAAS_PASSWORD": "wrong"}), \
              patch("playwright.sync_api.sync_playwright") as mock_sync:
             mock_sync.return_value.start.return_value = mock_pw
-            companies, key = _scrape_via_api()
-
-        assert companies == []
-        assert key == ""
+            with pytest.raises(WaasError, match="login failed"):
+                _scrape_via_api()
 
     def test_algolia_key_extraction_and_pagination(self):
         from waas import _scrape_via_api
@@ -1379,13 +1376,13 @@ class TestWaasPlaywrightIntegration:
         # Verify page.evaluate was called for Algolia key, IDs, and batch fetch
         assert page.evaluate.call_count >= 3
 
-    def test_batch_fetch_error_continues(self):
-        from waas import _scrape_via_api
+    def test_batch_fetch_all_errors_raises(self):
+        from waas import WaasError, _scrape_via_api
         page = self._mock_page()
         page.evaluate.side_effect = [
             "key",
             [1, 2],  # 2 IDs but only 1 batch (batch_size=10)
-            {"error": 500},  # batch returns error
+            {"error": 500, "csrf_present": True},  # batch returns error
         ]
 
         mock_context = MagicMock()
@@ -1399,10 +1396,8 @@ class TestWaasPlaywrightIntegration:
              patch("playwright.sync_api.sync_playwright") as mock_sync, \
              patch("waas.time.sleep"):
             mock_sync.return_value.start.return_value = mock_pw
-            companies, key = _scrape_via_api()
-
-        # Should not crash despite batch error
-        assert companies == []
+            with pytest.raises(WaasError, match="All company fetch batches failed"):
+                _scrape_via_api()
 
     def test_batch_delay_0_3s(self):
         from waas import _scrape_via_api
@@ -1534,23 +1529,21 @@ class TestAlgoliaFilterConfigIntegration:
 
 class TestWaasMissingCredentials:
     def test_no_credentials_returns_empty_from_api(self):
-        """Without WAAS_USERNAME/WAAS_PASSWORD, _scrape_via_api returns empty (no browser launched)."""
-        from waas import _scrape_via_api
+        """Without WAAS_USERNAME/WAAS_PASSWORD, _scrape_via_api raises WaasError."""
+        from waas import WaasError, _scrape_via_api
         with patch.dict("os.environ", {}, clear=True):
             import os
             os.environ.pop("WAAS_USERNAME", None)
             os.environ.pop("WAAS_PASSWORD", None)
-            companies, key = _scrape_via_api()
-        assert companies == []
-        assert key == ""
+            with pytest.raises(WaasError, match="WAAS_USERNAME/WAAS_PASSWORD not set"):
+                _scrape_via_api()
 
-    def test_no_credentials_scrape_direct_returns_empty(self):
-        """Without credentials, _scrape_direct returns empty job list (limited/no access)."""
-        from waas import _scrape_direct
-        with patch("waas._scrape_via_api", return_value=([], "")), \
-             patch("waas.WAAS_SEEN_FILE", MagicMock(exists=MagicMock(return_value=False))):
-            jobs = _scrape_direct(ignore_seen=False)
-        assert jobs == []
+    def test_no_credentials_scrape_direct_raises_waas_error(self):
+        """Without credentials, _scrape_direct raises WaasError."""
+        from waas import WaasError, _scrape_direct
+        with patch("waas._scrape_via_api", side_effect=WaasError("no creds")):
+            with pytest.raises(WaasError):
+                _scrape_direct(ignore_seen=False)
 
     def test_credentials_present_enables_authentication(self):
         """With WAAS_USERNAME/WAAS_PASSWORD set, _scrape_via_api attempts Playwright login."""

@@ -96,21 +96,26 @@ def _build_algolia_filter_string(filters: dict) -> str:
 # Auth + API helpers
 # ---------------------------------------------------------------------------
 
+class WaasError(Exception):
+    """Error with a structured reason for propagation to tool responses."""
+    pass
+
+
 def _scrape_via_api() -> tuple[list[dict], str]:
     """Log in, fetch all company IDs via Algolia, fetch company data via page.evaluate.
 
     Returns (companies_data, algolia_key). Companies_data is a list of company dicts.
     Uses Playwright for both auth and API calls to maintain session integrity.
+    Raises WaasError with a descriptive message on failure.
     """
     username = os.environ.get("WAAS_USERNAME", "")
     password = os.environ.get("WAAS_PASSWORD", "")
 
     if not username or not password:
-        logger.warning(
-            "WAAS_USERNAME/WAAS_PASSWORD not set. "
-            "Set them in .env for full job listings."
+        raise WaasError(
+            "WAAS_USERNAME/WAAS_PASSWORD not set in environment. "
+            "Set them in Claude Desktop's MCP server config."
         )
-        return [], ""
 
     from playwright.sync_api import sync_playwright
 
@@ -132,8 +137,10 @@ def _scrape_via_api() -> tuple[list[dict], str]:
         page.wait_for_timeout(5000)
 
         if "account.ycombinator.com" in page.url:
-            logger.warning("WAAS login failed — still on auth page. Check credentials.")
-            return [], ""
+            raise WaasError(
+                "WAAS login failed — still on auth page after submit. "
+                "Check WAAS_USERNAME/WAAS_PASSWORD credentials."
+            )
 
         logger.info("WAAS login successful")
 
@@ -146,8 +153,11 @@ def _scrape_via_api() -> tuple[list[dict], str]:
             "() => window.AlgoliaOpts ? window.AlgoliaOpts.key : ''"
         )
         if not algolia_key:
-            logger.warning("Could not extract Algolia key from page")
-            return [], ""
+            raise WaasError(
+                "Could not extract Algolia key from WAAS page. "
+                "The page may have changed or login session may be invalid. "
+                f"Current URL: {page.url}"
+            )
 
         # Step 3: Build filters and fetch all company IDs from Algolia
         filters = _load_waas_filters()
@@ -177,6 +187,7 @@ def _scrape_via_api() -> tuple[list[dict], str]:
                             }]
                         })
                     });
+                    if (!resp.ok) return {error: 'algolia_' + resp.status, url: resp.url};
                     const data = await resp.json();
                     const result = data.results[0];
                     nbPages = result.nbPages;
@@ -189,10 +200,14 @@ def _scrape_via_api() -> tuple[list[dict], str]:
             }
         """, [algolia_key, filter_str])
 
+        if isinstance(company_ids, dict) and "error" in company_ids:
+            raise WaasError(f"Algolia API request failed: {company_ids['error']}")
+
         logger.info("Found %d unique companies in Algolia", len(company_ids))
 
         # Step 4: Fetch company data in batches via browser fetch (preserves session/CSRF)
         all_companies = []
+        batch_errors = []
         batch_size = WAAS_FETCH_BATCH_SIZE
         for i in range(0, len(company_ids), batch_size):
             batch = company_ids[i : i + batch_size]
@@ -211,13 +226,22 @@ def _scrape_via_api() -> tuple[list[dict], str]:
                             },
                             body: JSON.stringify({ids: ids}),
                         });
-                        if (!resp.ok) return {error: resp.status};
+                        if (!resp.ok) return {error: resp.status, csrf_present: !!csrf};
                         return await resp.json();
                     }
                 """, batch)
 
                 if isinstance(result, dict) and "error" in result:
-                    logger.warning("companies/fetch returned %s for batch at %d", result["error"], i)
+                    status = result["error"]
+                    csrf_present = result.get("csrf_present", "unknown")
+                    batch_errors.append(f"batch@{i}: HTTP {status} (csrf_present={csrf_present})")
+                    logger.warning("companies/fetch returned %s for batch at %d (csrf=%s)",
+                                   status, i, csrf_present)
+                    # On 400/403, try refreshing the page to get a new CSRF token
+                    if status in (400, 403) and i == 0:
+                        logger.info("Refreshing page to get new CSRF token...")
+                        page.reload(timeout=15000)
+                        page.wait_for_timeout(2000)
                     continue
 
                 companies = result.get("companies", result) if isinstance(result, dict) else result
@@ -225,16 +249,26 @@ def _scrape_via_api() -> tuple[list[dict], str]:
                     all_companies.extend(companies)
 
                 time.sleep(0.3)
-            except Exception:
+            except Exception as exc:
+                batch_errors.append(f"batch@{i}: {exc}")
                 logger.warning("Failed to fetch company batch at offset %d", i, exc_info=True)
                 continue
 
-        logger.info("Fetched data for %d companies", len(all_companies))
+        logger.info("Fetched data for %d companies (%d batch errors)",
+                     len(all_companies), len(batch_errors))
+
+        if not all_companies and batch_errors:
+            raise WaasError(
+                f"All company fetch batches failed. "
+                f"Errors: {'; '.join(batch_errors[:5])}"
+            )
+
         return all_companies, algolia_key
 
+    except WaasError:
+        raise
     except Exception as e:
-        logger.warning("WAAS API scrape failed: %s", e, exc_info=True)
-        return [], ""
+        raise WaasError(f"WAAS API scrape failed: {e}") from e
     finally:
         if browser:
             browser.close()
@@ -334,7 +368,8 @@ def scrape_waas_jobs(ignore_seen: bool = False) -> list[dict[str, Any]]:
 
 
 def _scrape_via_subprocess(ignore_seen: bool) -> list[dict[str, Any]]:
-    """Run the scraper in a subprocess to avoid asyncio conflicts."""
+    """Run the scraper in a subprocess to avoid asyncio conflicts.
+    Raises WaasError if the subprocess fails, propagating stderr."""
     import subprocess
     import sys
 
@@ -345,18 +380,20 @@ def _scrape_via_subprocess(ignore_seen: bool) -> list[dict[str, Any]]:
     try:
         result = subprocess.run(args, capture_output=True, text=True, timeout=300)
     except subprocess.TimeoutExpired:
-        logger.warning("WAAS subprocess timed out")
-        return []
+        raise WaasError("WAAS subprocess timed out after 300s")
 
     if result.returncode != 0:
-        logger.warning("WAAS subprocess failed: %s", result.stderr)
-        return []
+        # stderr contains the actual error message from the subprocess
+        stderr = result.stderr.strip()
+        raise WaasError(f"WAAS subprocess failed (exit {result.returncode}): {stderr}")
 
     try:
         return json.loads(result.stdout)
     except json.JSONDecodeError:
-        logger.warning("WAAS subprocess returned invalid JSON: %s", result.stdout[:200])
-        return []
+        raise WaasError(
+            f"WAAS subprocess returned invalid JSON. "
+            f"stdout: {result.stdout[:200]}, stderr: {result.stderr[:200]}"
+        )
 
 
 def _scrape_direct(ignore_seen: bool) -> list[dict[str, Any]]:
@@ -615,6 +652,10 @@ if __name__ == "__main__":
         jobs = _scrape_direct(ignore_seen)
         print(json.dumps(jobs))
         print(f"{len(jobs)} jobs scraped", file=sys.stderr)
+    except WaasError as e:
+        # Structured error — propagated to parent process via stderr
+        print(f"WaasError: {e}", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

@@ -563,14 +563,29 @@ def get_job_details(job_url: str) -> str:
         resp.raise_for_status()
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Try rendered DOM first, then meta tags (WAAS is a JS SPA)
         desc_div = soup.select_one(".prose") or soup.select_one("[class*=description]")
-        description = desc_div.get_text(separator="\n", strip=True) if desc_div else ""
+        if desc_div:
+            description = desc_div.get_text(separator="\n", strip=True)
+        else:
+            meta = (soup.find("meta", attrs={"property": "description"})
+                    or soup.find("meta", attrs={"name": "description"})
+                    or soup.find("meta", attrs={"property": "og:description"}))
+            description = meta["content"] if meta and meta.get("content") else ""
+
         title_el = soup.select_one("h1")
-        title = title_el.get_text(strip=True) if title_el else ""
+        if title_el:
+            title = title_el.get_text(strip=True)
+        else:
+            title_meta = (soup.find("meta", attrs={"property": "title"})
+                          or soup.find("meta", attrs={"property": "og:title"}))
+            title = title_meta["content"] if title_meta and title_meta.get("content") else ""
 
         # Cache for next time
-        descs[job_url] = description
-        _save_descriptions(descs)
+        if description:
+            descs[job_url] = description
+            _save_descriptions(descs)
 
         return json.dumps({
             "job_url": job_url,
